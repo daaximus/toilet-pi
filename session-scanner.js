@@ -1,9 +1,11 @@
 import { createReadStream } from "node:fs";
-import { access, readdir, stat } from "node:fs/promises";
+import { access, open, readdir, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { buildHistoryPage, selectPersistedBranch } from "./history-page.js";
+import { getMessageImages, IMAGE_MIME_TYPES, MAX_IMAGES, MAX_IMAGE_BYTES } from "./server/public/image-attachments.js";
 
 const DEFAULT_MESSAGE_LIMIT = Number.parseInt(
   process.env.TOILET_PI_MESSAGE_LIMIT || "4000",
@@ -23,6 +25,10 @@ export function getDefaultSessionDir() {
   );
 }
 
+// TOILET_PI_SCAN_LIMIT: only the N most recently modified session files are
+// summarized per scan (0 or unset = all).
+export const SCAN_LIMIT = Math.max(0, Number.parseInt(process.env.TOILET_PI_SCAN_LIMIT || "0", 10) || 0);
+
 export async function scanSessions(sessionDir = getDefaultSessionDir()) {
   const resolvedSessionDir = path.resolve(sessionDir);
   try {
@@ -35,22 +41,28 @@ export async function scanSessions(sessionDir = getDefaultSessionDir()) {
   const files = [];
   await collectJsonlFiles(sessionDir, files);
 
-  const sessions = [];
-  const seenFiles = new Set();
+  // Stat up front so candidates can be ordered newest-first; with a scan limit
+  // only the most recently written files are parsed.
+  const candidates = [];
   for (const file of files) {
-    const cacheKey = path.resolve(file);
-    seenFiles.add(cacheKey);
-
-    let info;
     try {
-      info = await stat(file);
+      candidates.push({ file, info: await stat(file) });
     } catch (error) {
       if (error?.code === "ENOENT") {
-        summaryCache.delete(cacheKey);
+        summaryCache.delete(path.resolve(file));
         continue;
       }
       throw error;
     }
+  }
+  candidates.sort((a, b) => b.info.mtimeMs - a.info.mtimeMs);
+
+  const sessions = [];
+  const seenFiles = new Set();
+  for (const { file, info } of candidates) {
+    if (SCAN_LIMIT > 0 && sessions.length >= SCAN_LIMIT) break;
+    const cacheKey = path.resolve(file);
+    seenFiles.add(cacheKey);
 
     const fingerprint = getFileFingerprint(info);
     const cached = summaryCache.get(cacheKey);
@@ -89,6 +101,7 @@ export async function readSessionSnapshot(sessionFile, options = {}) {
   const parsed = await readSessionBranch(resolvedFile);
   if (!parsed) return null;
   const { header, entries, updatedAt } = parsed;
+  await hydrateImageBlobs(entries, options.blobDirs || [], Number(options.maxHistoryBytes) || DEFAULT_HISTORY_BYTES);
   const history = entries.filter(e => e.type === "message").map(e => {
     const message = sanitizeMessage(e.message, e.timestamp);
     return message && { ...message, ...(e.id ? { entryId: e.id } : {}) };
@@ -134,14 +147,71 @@ export async function readSessionBranch(file) {
 export async function readSessionHistory(file, options = {}) {
   const branch = await readSessionBranch(file);
   if (!branch || (options.sessionGuid && options.sessionGuid !== branch.header.id)) throw new Error("Session file identity mismatch");
-  return buildHistoryPage(branch.entries, { ...options, source: "persisted-branch", complete: branch.complete, leafId: branch.leafId });
+  const pageOptions = { ...options, source: "persisted-branch", complete: branch.complete, leafId: branch.leafId };
+  const page = buildHistoryPage(branch.entries, pageOptions);
+  const ids = new Set(page.messages.map(message => message.entryId).filter(Boolean));
+  const complete = await hydrateImageBlobs(branch.entries.filter(entry => ids.has(entry.id)), options.blobDirs || [], 4 * 1024 * 1024);
+  return buildHistoryPage(branch.entries, { ...pageOptions, complete: branch.complete && complete });
+}
+
+async function hydrateImageBlobs(entries, blobDirs, budget) {
+  let complete = true;
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const message = entries[index]?.message;
+    if (message?.role !== "user" || !Array.isArray(message.content)) continue;
+    let imageCount = 0;
+    for (const block of message.content) {
+      if (block?.type !== "image" || ++imageCount > MAX_IMAGES) continue;
+      const hash = typeof block.data === "string" && /^blob:sha256:([a-f0-9]{64})$/.exec(block.data)?.[1];
+      if (!hash || !IMAGE_MIME_TYPES.includes(block.mimeType)) continue;
+      let resolved = false;
+      for (const directory of blobDirs) {
+        if (budget <= 0) break;
+        let file;
+        try {
+          file = await open(path.join(directory, hash), "r");
+          const info = await file.stat();
+          if (!info.isFile() || !info.size || info.size > MAX_IMAGE_BYTES || info.size > budget) continue;
+          const bytes = Buffer.alloc(info.size + 1);
+          const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+          if (bytesRead !== info.size) continue;
+          const data = bytes.subarray(0, bytesRead);
+          if (createHash("sha256").update(data).digest("hex") !== hash) continue;
+          const raster = block.mimeType === "image/png" ? data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+            : block.mimeType === "image/jpeg" ? data[0] === 255 && data[1] === 216 && data[2] === 255
+            : block.mimeType === "image/gif" ? /^GIF8[79]a$/.test(data.toString("ascii", 0, 6))
+            : data.toString("ascii", 0, 4) === "RIFF" && data.toString("ascii", 8, 12) === "WEBP";
+          if (!raster) continue;
+          block.data = data.toString("base64");
+          budget -= bytesRead;
+          resolved = true;
+          break;
+        } catch (error) {
+          if (!["ENOENT", "ENOTDIR", "EACCES", "EPERM"].includes(error.code)) throw error;
+        } finally { await file?.close(); }
+      }
+      if (!resolved) complete = false;
+    }
+  }
+  return complete;
 }
 
 async function collectJsonlFiles(dir, files) {
   const entries = await readdir(dir, { withFileTypes: true });
+  // OMP stores a session as `<name>.jsonl` plus a sibling `<name>/` directory
+  // holding advisor and subagent transcripts (`__advisor.jsonl`, `<Agent>.jsonl`).
+  // Those carry their own session headers but are not resumable sessions, so a
+  // directory shadowed by a same-named session file is not descended into.
+  const sessionNames = new Set();
+  for (const entry of entries) {
+    if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+      sessionNames.add(entry.name.slice(0, -".jsonl".length));
+    }
+  }
   for (const entry of entries) {
     const fullPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {
+      if (sessionNames.has(entry.name)) continue;
       await collectJsonlFiles(fullPath, files);
     } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
       files.push(fullPath);
@@ -269,11 +339,13 @@ function sanitizeMessage(message, fallbackTimestamp) {
 
   if (message.role === "user") {
     const text = extractUserText(message.content);
-    if (!text) return null;
+    const images = getMessageImages(message.content);
+    if (!text && !images?.length) return null;
     return {
       role: "user",
       timestamp: normalizeTimestamp(message.timestamp || fallbackTimestamp),
       text,
+      ...(images ? { images } : {}),
     };
   }
 

@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import { WebSocket } from "ws";
+import { createDirectory, listDirectory } from "./directory-browser.js";
 import {
   buildConnectUrl,
   parseToiletPiInput,
@@ -78,33 +79,68 @@ function send(message) {
   }
 }
 
-async function scanSessionCatalog() {
-  const sessions = await scanSupervisorSessions(RUNTIME_CONFIG);
-  catalogSessionsByGuid.clear();
-  for (const session of sessions) {
-    catalogSessionsByGuid.set(session.sessionGuid, session);
-  }
-  return sessions;
+// A cold scan of a large session tree can take longer than SCAN_INTERVAL_MS;
+// overlapping scans would all miss the summary cache and reread every file.
+// Callers arriving while a scan is in flight share its result.
+let catalogScanInFlight = null;
+
+function scanSessionCatalog() {
+  if (catalogScanInFlight) return catalogScanInFlight;
+  catalogScanInFlight = (async () => {
+    const sessions = await scanSupervisorSessions(RUNTIME_CONFIG);
+    catalogSessionsByGuid.clear();
+    for (const session of sessions) {
+      catalogSessionsByGuid.set(session.sessionGuid, session);
+    }
+    return sessions;
+  })().finally(() => {
+    catalogScanInFlight = null;
+  });
+  return catalogScanInFlight;
 }
 
-async function sendSessionCatalog() {
+// The full catalog is multi-megabyte and the server re-broadcasts it to every
+// web client on receipt. Timer ticks only send when the serialized catalog
+// differs from the last one sent on this socket; open, explicit list_sessions,
+// and runner exits always send.
+let lastSentCatalog = null;
+
+async function sendSessionCatalog({ force = true } = {}) {
   const sessions = await scanSessionCatalog();
   const wireSessions = sessions.map((session) => {
     const wireSession = { ...session };
     delete wireSession.runtime;
     return wireSession;
   });
-  send({
+  const payload = JSON.stringify({
     type: "host_sessions",
     hostId: HOST_ID,
     sessions: wireSessions,
   });
+  if (!force && payload === lastSentCatalog) return;
+  if (!isOpen(ws)) return;
+  try {
+    ws.send(payload);
+    lastSentCatalog = payload;
+  } catch (error) {
+    log(
+      `socket send failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    try {
+      ws.close();
+    } catch {
+      // Ignore.
+    }
+  }
 }
 
 function ensureCatalogTimer() {
   if (catalogTimer) return;
   catalogTimer = setInterval(() => {
-    sendSessionCatalog().catch((error) => {
+    // The caller that started the in-flight scan sends the catalog when it
+    // resolves; a tick joining it would only emit a duplicate.
+    if (catalogScanInFlight) return;
+    sendSessionCatalog({ force: false }).catch((error) => {
       log(`catalog scan failed: ${error.message}`);
     });
   }, SCAN_INTERVAL_MS);
@@ -193,7 +229,8 @@ async function connect() {
         if (!catalogSessionsByGuid.has(message.sessionGuid)) await scanSessionCatalog();
         const file = catalogSessionsByGuid.get(message.sessionGuid)?.sessionFile;
         if (!file) throw new Error("Unknown session");
-        const history = await readSessionHistory(file, { sessionGuid: message.sessionGuid, since: message.since, last: message.last ?? 100 });
+        const history = await readSessionHistory(file, { sessionGuid: message.sessionGuid, since: message.since, last: message.last ?? 100,
+          blobDirs: getSessionBlobDirs(message.sessionGuid, file) });
         send({ ...response, success: true, data: { history } });
       } catch (error) {
         const code = ["cursor_not_found", "too_large"].includes(error?.code) ? error.code : "history_failed";
@@ -216,6 +253,26 @@ async function connect() {
       return;
     }
 
+    if (message.type === "browse_directory" || message.type === "create_directory") {
+      const response = { type: "directory_listing", requestId: message.requestId, hostId: HOST_ID };
+      try {
+        const listing = message.type === "create_directory"
+          ? await createDirectory(message.path)
+          : await listDirectory(message.path ?? null);
+        send({ ...response, ...listing });
+      } catch (error) {
+        send({ ...response, error: error?.code === "ENOENT" ? "Directory not found"
+          : error?.code === "EACCES" || error?.code === "EPERM" ? "Permission denied"
+          : error instanceof Error ? error.message : "Could not read directory" });
+      }
+      return;
+    }
+
+    if (message.type === "stop_background_session") {
+      stopBackgroundRunner(message);
+      return;
+    }
+
     if (message.type === "read_session_snapshot") {
       await sendSessionSnapshot(message);
     }
@@ -230,6 +287,12 @@ async function connect() {
   ws.on("error", (error) => {
     log(`socket error: ${error.message}`);
   });
+}
+
+function getSessionBlobDirs(sessionGuid, sessionFile) {
+  const target = selectSupervisorTarget({ sessionGuid, sessionFile }, RUNTIME_CONFIG, catalogSessionsByGuid);
+  // Both locations come from configured runtime roots, never from transcript data.
+  return [...new Set([path.join(target.agentDir, "blobs"), path.join(path.dirname(target.sessionDir), "blobs")])];
 }
 
 async function sendSessionSnapshot(message) {
@@ -258,7 +321,7 @@ async function sendSessionSnapshot(message) {
   }
 
   try {
-    const session = await readSessionSnapshot(sessionFile);
+    const session = await readSessionSnapshot(sessionFile, { blobDirs: getSessionBlobDirs(sessionGuid, sessionFile) });
     if (!session) {
       send({
         type: "session_snapshot_error",
@@ -407,6 +470,8 @@ async function startBackgroundRunner(message) {
   });
 
   child.on("exit", (code, signal) => {
+    const record = children.get(childKey);
+    if (record?.stopTimer) clearTimeout(record.stopTimer);
     children.delete(childKey);
     log(
       `background runner exited (${message.sessionGuid || requestId || child.pid}, code=${code}, signal=${signal})`,
@@ -423,6 +488,39 @@ async function startBackgroundRunner(message) {
     sendSessionCatalog().catch(() => {});
     maybeFinishShutdown();
   });
+}
+
+// Gives the runner's own terminate_session handling a chance to finish (abort,
+// wait for idle, shutdown), then escalates. Children are keyed by session guid
+// for resumed sessions and by launch request id for brand-new ones.
+const CHILD_TERMINATE_GRACE_MS = Number.parseInt(
+  process.env.TOILET_PI_CHILD_TERMINATE_GRACE_MS || "6000",
+  10,
+);
+
+function findChildRecord(sessionGuid, requestId) {
+  const key = [sessionGuid && `session:${sessionGuid}`, requestId && `launch:${requestId}`]
+    .find((candidate) => candidate && children.has(candidate));
+  return key ? { key, record: children.get(key) } : null;
+}
+
+function stopBackgroundRunner(message) {
+  const found = findChildRecord(message.sessionGuid, message.requestId);
+  if (!found || found.record.child.exitCode !== null) return;
+  const { key, record } = found;
+  if (record.stopTimer) return;
+  record.stopTimer = setTimeout(() => {
+    record.stopTimer = null;
+    if (record.child.exitCode !== null) return;
+    log(`stopping background runner for ${key} (did not exit after terminate_session)`);
+    signalChild(record, "SIGTERM");
+    setTimeout(() => {
+      if (record.child.exitCode === null) {
+        log(`force killing background runner for ${key}`);
+        signalChild(record, "SIGKILL");
+      }
+    }, CHILD_SHUTDOWN_GRACE_MS);
+  }, CHILD_TERMINATE_GRACE_MS);
 }
 
 function signalChild(record, signal) {

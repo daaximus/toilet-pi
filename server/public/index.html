@@ -211,6 +211,75 @@
 			color: #a5d6ff;
 		}
 
+		.badge.question {
+			background: rgba(255, 123, 114, 0.16);
+			color: #ffa198;
+		}
+
+		.question-card {
+			margin: 8px 12px 0;
+			padding: 12px;
+			border: 1px solid #ffa198;
+			border-radius: 12px;
+			background: var(--panel-2);
+			display: flex;
+			flex-direction: column;
+			gap: 10px;
+		}
+
+		.question-card h4 {
+			margin: 0;
+			font-size: 13px;
+			color: #ffa198;
+		}
+
+		.question-block {
+			display: flex;
+			flex-direction: column;
+			gap: 6px;
+		}
+
+		.question-text {
+			font-weight: 600;
+		}
+
+		.question-option {
+			display: flex;
+			align-items: flex-start;
+			gap: 8px;
+			padding: 8px 10px;
+			border: 1px solid var(--border);
+			border-radius: 8px;
+			cursor: pointer;
+		}
+
+		.question-option input {
+			margin-top: 3px;
+		}
+
+		.question-option-copy {
+			display: flex;
+			flex-direction: column;
+			gap: 2px;
+			min-width: 0;
+		}
+
+		.question-option-desc {
+			font-size: 12px;
+			color: var(--muted);
+		}
+
+		.question-custom {
+			width: 100%;
+			box-sizing: border-box;
+		}
+
+		.question-actions {
+			display: flex;
+			justify-content: flex-end;
+			gap: 8px;
+		}
+
 		.app-shell {
 			height: 100%;
 			min-height: 100svh;
@@ -231,7 +300,7 @@
 			background: var(--panel);
 			border-right: 1px solid var(--border);
 			display: grid;
-			grid-template-rows: auto auto minmax(0, 1fr);
+			grid-template-rows: auto auto auto minmax(0, 1fr);
 			min-height: 0;
 		}
 
@@ -306,6 +375,33 @@
 			background: var(--blue-soft);
 			border-color: rgba(121, 192, 255, 0.25);
 			color: #79c0ff;
+		}
+
+		.browser-search {
+			display: flex;
+			gap: 8px;
+			padding: 12px 16px;
+			border-bottom: 1px solid var(--border);
+		}
+
+		.browser-search input {
+			width: 100%;
+			min-width: 0;
+			padding: 10px;
+			font: inherit;
+			font-size: 16px;
+			color: var(--text);
+			background: var(--panel-2);
+			border: 1px solid var(--border);
+			border-radius: 8px;
+		}
+
+		.browser-search input:focus-visible {
+			outline: 2px solid var(--blue);
+		}
+
+		#browser-search-clear {
+			min-width: 44px;
 		}
 
 		.sidebar-body {
@@ -1019,7 +1115,7 @@
 
 		.composer {
 			display: grid;
-			grid-template-columns: auto minmax(0, 1fr) auto;
+			grid-template-columns: minmax(0, 1fr) auto auto;
 			gap: 10px;
 			align-items: end;
 			background: rgba(13, 17, 23, 0.78);
@@ -1036,11 +1132,24 @@
 			line-height: 1.4;
 		}
 
+		.composer-input { min-width: 0; }
+		.attachment-tools { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+		.attachment-tools small { color: var(--muted); font-size: 11px; }
+		#attach-image-btn { min-height: 44px; }
+		#attachment-previews, .message-images { display: flex; gap: 8px; flex-wrap: wrap; }
+		#attachment-previews[hidden] { display: none; }
+		#attachment-previews { margin-top: 8px; }
+		.attachment-preview { max-width: 140px; }
+		.attachment-preview button { min-height: 44px; font-size: 11px; }
+		.message-images img { max-width: min(100%, 360px); max-height: 320px; object-fit: contain; border-radius: 8px; }
+		.attachment-preview img { max-height: 100px; max-width: 120px; }
+
 		body.confirm-open .confirm-modal-scrim {
 			display: flex;
 		}
 
-		.confirm-modal-scrim {
+		.confirm-modal-scrim,
+		.folder-modal-scrim {
 			position: fixed;
 			inset: 0;
 			background: rgba(0, 0, 0, 0.62);
@@ -1125,6 +1234,58 @@
 
 		.confirm-actions {
 			justify-content: space-between;
+		}
+
+		body.folder-open #folder-modal-scrim {
+			display: flex;
+		}
+
+		.folder-card {
+			width: min(560px, 94vw);
+			max-width: 560px;
+		}
+
+		.folder-path-row {
+			display: flex;
+			gap: 6px;
+			align-items: center;
+		}
+
+		.folder-path-row input {
+			flex: 1;
+			min-width: 0;
+		}
+
+		.folder-roots {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 6px;
+		}
+
+		.folder-roots:empty {
+			display: none;
+		}
+
+		.folder-entries {
+			display: flex;
+			flex-direction: column;
+			gap: 2px;
+			min-height: 120px;
+			max-height: 40vh;
+			overflow-y: auto;
+			border: 1px solid var(--border);
+			border-radius: 8px;
+			padding: 4px;
+		}
+
+		.folder-entries button {
+			flex: none;
+			width: 100%;
+			min-height: 40px;
+			text-align: left;
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
 		}
 
 		.sidebar-body {
@@ -1579,7 +1740,7 @@
 
 		#model-picker {
 			display: grid;
-			grid-template-columns: auto minmax(0, 1fr) minmax(90px, auto) auto;
+			grid-template-columns: repeat(2, minmax(0, 1fr));
 			gap: 8px;
 			align-items: center;
 			padding: 0 16px 10px;
@@ -1637,7 +1798,8 @@
 				grid-template-columns: minmax(0, 1fr) auto;
 			}
 
-			#model-picker select:first-of-type {
+			#model-picker select[aria-label="Model target"],
+			#model-picker select[aria-label="Session model"] {
 				grid-column: 1 / -1;
 				order: -1;
 			}
@@ -1730,6 +1892,32 @@
 		</section>
 	</div>
 
+	<div class="folder-modal-scrim" id="folder-modal-scrim">
+		<section class="confirm-card folder-card" role="dialog" aria-modal="true" aria-labelledby="folder-modal-title">
+			<div class="install-header">
+				<h3 id="folder-modal-title">New session in folder</h3>
+				<button id="folder-close-btn" class="icon-button subtle" aria-label="Close folder picker">✕</button>
+			</div>
+			<select id="folder-host-select" aria-label="Computer"></select>
+			<div class="folder-path-row">
+				<button id="folder-up-btn" type="button" class="subtle" aria-label="Parent folder">↑</button>
+				<input id="folder-path-input" type="text" spellcheck="false" autocomplete="off" aria-label="Folder path" placeholder="Folder path">
+				<button id="folder-go-btn" type="button" class="subtle">Go</button>
+			</div>
+			<div id="folder-roots" class="folder-roots"></div>
+			<div id="folder-entries" class="folder-entries" role="listbox" aria-label="Subfolders"></div>
+			<div class="folder-path-row">
+				<input id="folder-new-name" type="text" spellcheck="false" autocomplete="off" aria-label="New folder name" placeholder="New folder name">
+				<button id="folder-create-btn" type="button" class="subtle">Create</button>
+			</div>
+			<div id="folder-status" class="auth-copy" role="status"></div>
+			<div class="confirm-actions">
+				<button id="folder-cancel-btn" type="button" class="subtle">Cancel</button>
+				<button id="folder-start-btn" type="button">Start session here</button>
+			</div>
+		</section>
+	</div>
+
 	<div class="install-modal-scrim" id="installation-modal-scrim">
 		<section class="install-card" role="dialog" aria-modal="true" aria-labelledby="installation-modal-title">
 			<div class="install-header">
@@ -1760,6 +1948,11 @@
 				<button id="view-projects-btn" class="tab-button">Projects</button>
 			</div>
 
+			<div class="browser-search" role="search" aria-label="Projects and sessions">
+				<input id="browser-search" type="search" placeholder="Search projects or sessions…" aria-label="Search projects or sessions by name" autocomplete="off" />
+				<button id="browser-search-clear" type="button" aria-label="Clear search" hidden>Clear</button>
+			</div>
+
 			<div class="sidebar-body">
 				<div id="browser-list"></div>
 			</div>
@@ -1785,6 +1978,7 @@
 							<div class="header-menu-panel">
 								<button id="toggle-live-turn-details-btn">Collapse live turn details</button>
 								<button id="new-session-btn">New Session</button>
+								<button id="new-session-folder-btn">New Session in folder…</button>
 								<button id="kill-session-btn" class="danger">Kill Session</button>
 							</div>
 						</details>
@@ -1793,7 +1987,7 @@
 			</div>
 
 			<details class="model-controls">
-				<summary><span class="model-controls-title">Model</span><span id="model-picker-label" class="model-controls-current"></span></summary>
+				<summary><span class="model-controls-title">Models &amp; roles</span><span id="model-picker-label" class="model-controls-current"></span></summary>
 				<div id="model-picker"></div>
 			</details>
 
@@ -1812,8 +2006,18 @@
 				</div>
 			</div>
 
+			<form id="question-card" class="question-card" hidden></form>
+
 			<div class="composer">
-				<textarea id="message-input" placeholder="Send a message to the active session…" autocomplete="off" rows="3"></textarea>
+				<div class="composer-input">
+					<textarea id="message-input" placeholder="Send a message to the active session…" autocomplete="off" rows="3"></textarea>
+					<div class="attachment-tools">
+						<button id="attach-image-btn" type="button" title="Attach images">Attach</button>
+						<small>4 images · 20 MiB each before resizing</small>
+						<input id="image-picker" type="file" accept="image/jpeg,image/png,image/webp,image/gif" multiple hidden />
+					</div>
+					<div id="attachment-previews" aria-label="Image attachments" hidden></div>
+				</div>
 				<button id="abort-btn" class="danger icon-button abort-button" title="Abort active generation" aria-label="Abort active generation" disabled>■</button>
 				<button id="send-btn" class="primary" title="Send" aria-label="Send" disabled>🎲</button>
 			</div>

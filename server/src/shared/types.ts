@@ -1,6 +1,8 @@
 import type { ConnectionAuth } from './auth.js'
 import type {
+  ImageAttachment,
   OverviewHost,
+  PendingQuestion,
   QueuedInput,
   RunnerRole,
   SanitizedMessage,
@@ -45,6 +47,7 @@ export interface ActiveTool {
 export interface PendingInput {
   inputId: string
   text: string
+  images?: ImageAttachment[]
 }
 
 export interface WebClientState {
@@ -110,6 +113,10 @@ export interface SessionState {
   streamingThinkingText: string | null
   activeTools: Map<string, ActiveTool>
   runnerStatus: string | null
+  /** Request id of the launch that spawned the current background runner, when known. */
+  launchRequestId: string | null
+  /** Clarifying question the agent is blocked on; answered from the browser or the local TUI. */
+  pendingQuestion: PendingQuestion | null
   pendingInputs: PendingInput[]
   queuedInputs: QueuedInput[]
   updatedAt: number

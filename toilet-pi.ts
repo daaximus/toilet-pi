@@ -1,7 +1,11 @@
 import os from "node:os";
 import { createModelController } from "./model-control.js";
+import { createAskBridge } from "./ask-bridge.js";
+import { createOmpRoleControls } from "./omp-model-controls.js";
 import { createInputTracker } from "./input-tracker.js";
 import { buildHistoryPage } from "./history-page.js";
+import { getMessageImages, userMessageContent } from "./server/public/image-attachments.js";
+import type { ImageAttachment } from "./server/src/shared/protocol.js";
 import { WebSocket } from "ws";
 import type {
   ExtensionAPI,
@@ -45,7 +49,7 @@ const MAX_SERVER_HISTORY_BYTES = Math.max(
 const SERVER_TEXT_TRUNCATION_SUFFIX = "\n... (truncated for toilet-pi at 50KB)";
 
 interface ServerMessage {
-  type: "input" | "abort" | "abort_and_release" | "terminate_session" | "session_request" | "control_command";
+  type: "input" | "abort" | "abort_and_release" | "terminate_session" | "session_request" | "control_command" | "answer_question";
   mode?: "prompt" | "steer" | "followUp";
   since?: string;
   last?: number;
@@ -55,14 +59,21 @@ interface ServerMessage {
   provider?: string;
   modelId?: string;
   thinkingLevel?: string;
+  role?: string;
+  scope?: "global" | "project";
+  clear?: true;
   text?: string;
+  images?: ImageAttachment[];
   inputId?: string;
+  questionId?: string;
+  answers?: Array<{ id: string; selectedOptions: string[]; customInput?: string }>;
 }
 
 interface WebMessage {
   role: "user" | "assistant";
   timestamp?: number;
   text: string;
+  images?: ImageAttachment[];
   thinkingText?: string;
   stopReason?: string;
   remoteInputId?: string;
@@ -122,12 +133,37 @@ export default function (pi: ExtensionAPI) {
     pi,
     getContext: () => ctx,
     hasPendingInput: () => pendingRemoteInputIds.length > 0 || pendingLocalQueuedInputs.length > 0 || inputTracker.pending(),
-    // Lazy import keeps older/OMP runtimes usable even when this optional API
-    // is absent. Do not substitute a locally guessed capability table.
-    loadThinkingLevels: async () => (await import("@earendil-works/pi-ai")).getSupportedThinkingLevels,
+    // Use native metadata first; Pi keeps its own helper. Both imports remain
+    // lazy so an unsupported optional feature cannot prevent extension loading.
+    loadThinkingLevels: async () => {
+      try {
+        const { getSupportedEfforts } = await import("@oh-my-pi/pi-catalog/model-thinking");
+        return model => model.reasoning ? ["off", ...getSupportedEfforts(model)] : ["off"];
+      } catch {
+        return (await import("@earendil-works/pi-ai")).getSupportedThinkingLevels;
+      }
+    },
+    loadRoleControls: async context => {
+      const [{ findScopedSettings }, { getKnownRoleIds, getRoleInfo, roleCandidatePool }, { resolveModelRoleValue }] = await Promise.all([
+        import("@oh-my-pi/pi-coding-agent/config/settings"),
+        import("@oh-my-pi/pi-coding-agent/config/model-roles"),
+        import("@oh-my-pi/pi-coding-agent/config/model-resolver"),
+      ]);
+      const settings = findScopedSettings(context.cwd);
+      if (!settings) return null;
+      // OMP 18.8 uses typed setting tokens; older OMP exposes Settings.get.
+      // Neither optional module exists in Pi, so static imports cannot work.
+      const getStorage = typeof settings.get === "function"
+        ? () => settings.get("modelRoleStorage")
+        : await import("@oh-my-pi/pi-coding-agent/config/model-settings").then(({ cfgModelRoleStorage }) => () => cfgModelRoleStorage.get(settings));
+      return createOmpRoleControls({ settings, getKnownRoleIds, getRoleInfo, resolveModelRoleValue,
+        roleCandidatePool, modelRegistry: context.modelRegistry, getStorage });
+    },
   });
   const inputTracker = createInputTracker({ pi, getContext: () => ctx,
     configuring: () => modelController.isConfiguring(), emit: emitSessionEvent });
+  const askBridge = createAskBridge({ emit: emitSessionEvent, log: logError, localDialog: ROLE === "interactive" });
+  askBridge.register(pi);
   let supportsSettlement = false;
   let settlementHandlerRegistered = false;
   const pendingRemoteInputIds: string[] = [];
@@ -476,7 +512,7 @@ export default function (pi: ExtensionAPI) {
     send({
       type: "hello",
       role: ROLE,
-      capabilities: ["model_control_v1", "input_tracking_v1", "history_v1", ...(supportsSettlement ? ["agent_settled_v1"] : [])],
+      capabilities: ["model_control_v1", "model_roles_v1", "image_input_v1", "input_tracking_v1", "history_v1", ...(supportsSettlement ? ["agent_settled_v1"] : [])],
       configuration: modelController.configuration(),
       hostId: HOST_ID,
       hostname: os.hostname(),
@@ -494,6 +530,7 @@ export default function (pi: ExtensionAPI) {
       streamingThinkingText: lastThinkingText,
       history: buildHistory(ctx),
       updatedAt: getSessionUpdatedAt(ctx),
+      pendingQuestion: askBridge.pendingQuestion(),
     });
   }
 
@@ -811,8 +848,14 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    if (message.type === "input" && message.text) {
-      await dispatchIncomingInput(message.text, message.inputId || null);
+    if (message.type === "answer_question") {
+      // A stale answer (question already resolved locally): resync the browser.
+      if (!askBridge.answer(message)) emitSessionEvent({ type: "question", question: askBridge.pendingQuestion() });
+      return;
+    }
+
+    if (message.type === "input" && (message.text || message.images?.length)) {
+      await dispatchIncomingInput(message.text || "", message.inputId || null, message.images);
     }
   }
 
@@ -825,10 +868,10 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  async function dispatchIncomingInput(text: string, inputId: string | null = null) {
+  async function dispatchIncomingInput(text: string, inputId: string | null = null, images?: ImageAttachment[]) {
     if (!ctx) return;
     if (modelController.isConfiguring()) {
-      emitSessionEvent({ type: "remote_input_failed", inputId });
+      emitSessionEvent({ type: "remote_input_failed", inputId, message: "Session is being configured; retry your retained draft" });
       return;
     }
     const isExtensionCommand = isExtensionCommandInput(text);
@@ -841,21 +884,25 @@ export default function (pi: ExtensionAPI) {
       pendingRemoteInputIds.push(inputId);
     }
     try {
+      if (images?.length && isExtensionCommand) throw new Error("Images cannot be sent to extension commands; send them as a normal message");
+      if (images?.length && Array.isArray(ctx.model?.input) && !ctx.model.input.includes("image")) {
+        throw new Error("The selected model does not support images. Choose a vision-capable model and retry your retained draft.");
+      }
+      const content = userMessageContent(text, images);
       if (ctx.isIdle()) {
-        pi.sendUserMessage(text, { expandPromptTemplates: true });
+        pi.sendUserMessage(content, { expandPromptTemplates: true });
       } else {
-        pi.sendUserMessage(text, {
+        pi.sendUserMessage(content, {
           deliverAs: "steer",
           expandPromptTemplates: true,
         });
       }
-    } catch {
+    } catch (error) {
       if (inputId) {
         const index = pendingRemoteInputIds.indexOf(inputId);
         if (index >= 0) pendingRemoteInputIds.splice(index, 1);
-        emitSessionEvent({ type: "remote_input_failed", inputId });
+        emitSessionEvent({ type: "remote_input_failed", inputId, message: error instanceof Error ? error.message : "Runtime could not accept the message" });
       }
-      // Best effort. If the message cannot be injected we silently ignore it.
     }
   }
 
@@ -1025,6 +1072,7 @@ export default function (pi: ExtensionAPI) {
 
   async function handleOmpSessionReplacement(context: ExtensionContext) {
     ctx = context;
+    modelController.bindContext(context);
     if (await reconnectForSessionChange()) return;
     inputTracker.invalidate();
     resetSessionTracking(context);
@@ -1034,6 +1082,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, context) => {
     const previousSessionGuid = currentSessionGuid;
     ctx = context;
+    modelController.bindContext(context);
     currentSessionGuid = getSessionGuid(context);
     const sessionChanged = previousSessionGuid !== null && previousSessionGuid !== currentSessionGuid;
     if (sessionChanged) closeSocket("session changed");
@@ -1437,11 +1486,13 @@ function sanitizeMessage(
 
   if (message.role === "user") {
     const text = extractUserText(message.content);
-    if (!text) return null;
+    const images = getMessageImages(message.content);
+    if (!text && !images?.length) return null;
     return {
       role: "user",
       timestamp: message.timestamp,
       text,
+      ...(images ? { images } : {}),
     };
   }
 

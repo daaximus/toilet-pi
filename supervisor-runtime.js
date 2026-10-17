@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { scanSessions } from "./session-scanner.js";
+import { SCAN_LIMIT, scanSessions } from "./session-scanner.js";
 
 export const SUPERVISOR_RUNTIMES = Object.freeze({
   PI: "pi",
@@ -79,9 +79,10 @@ export async function scanSupervisorSessions(runtimeConfig) {
     }
   }
 
-  return Array.from(sessionsByGuid.values()).sort(
+  const merged = Array.from(sessionsByGuid.values()).sort(
     (a, b) => b.updatedAt - a.updatedAt,
   );
+  return SCAN_LIMIT > 0 ? merged.slice(0, SCAN_LIMIT) : merged;
 }
 
 export function selectSupervisorTarget(

@@ -134,6 +134,7 @@ export function createControlRouter(deps: {
       source: history.source, sanitized: true, complete: history.complete, truncated: history.truncated,
       leafId: history.leafId, nextCursor: history.nextCursor, hasMore: history.hasMore,
       messages: history.messages.map(m => ({ role: m.role, text: m.text, entryId: m.entryId, timestamp: m.timestamp,
+        ...(m.role === 'user' && m.images ? { images: m.images } : {}),
         ...(m.role === 'assistant' ? { stopReason: m.stopReason } : {}),
         ...(m.role === 'toolResult' ? { toolName: m.toolName, isError: m.isError } : {}),
       } as typeof m)),

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createModelController } from "../model-control.js";
+import { createOmpRoleControls } from "../omp-model-controls.js";
 
 function fixture() {
   const models = [
@@ -121,4 +122,145 @@ test("runtime refusal or clamping never reports successful requested configurati
   f.ctx.model = f.models[1];
   f.pi.setThinkingLevel = () => {};
   assert.equal((await f.request("configure", { thinkingLevel: "high" })).error.code, "configuration_changed");
+});
+
+function roleFixture(overrides = {}) {
+  const f = fixture();
+  const global = { advisor: "test/large:high" };
+  const project = {};
+  const saves = [];
+  const settings = {
+    get: key => key === "modelRoleStorage" ? "project" : undefined,
+    getModelRole: role => project[role] || global[role],
+    getModelRoleSource: role => project[role] ? "project" : global[role] ? "global" : "default",
+    getGlobalModelRole: role => global[role],
+    getProjectModelRole: role => project[role],
+    setModelRole(role, value) { if (value === undefined) delete global[role]; else global[role] = value; },
+    setProjectModelRole(role, value) { project[role] = value; },
+    clearProjectModelRole(role) { delete project[role]; },
+    async flush() { saves.push("flush"); },
+  };
+  const controls = createOmpRoleControls({
+    settings, getKnownRoleIds: () => ["default", "advisor", "custom"],
+    getRoleInfo: id => ({ name: id }),
+    resolveModelRoleValue(value, models) {
+      const [key, thinkingLevel] = value.split(":");
+      return { model: models.find(model => `${model.provider}/${model.id}` === key), thinkingLevel };
+    },
+    ...overrides,
+  });
+  const controller = createModelController({ ...f.options, loadRoleControls: async () => controls });
+  const request = (operation, fields = {}) => controller.run({ requestId: "r", sessionGuid: "session", operation, ...fields });
+  return { ...f, controller, request, settings, global, project, saves, controls };
+}
+
+test("OMP enumerates actual roles and projects only model identities and settings metadata", async () => {
+  const f = roleFixture();
+  const response = await f.request("get_models");
+  assert.equal(response.success, true);
+  assert.equal(response.data.configuration.roleStorage, "project");
+  assert.deepEqual(response.data.configuration.roles.map(role => role.id), ["default", "advisor", "custom"]);
+  assert.deepEqual(response.data.configuration.roles[1], {
+    id: "advisor", name: "advisor", configured: true, provider: "test", modelId: "large", thinkingLevel: "high", source: "global",
+  });
+  assert.doesNotMatch(JSON.stringify(response), /secret|headers|baseUrl/);
+  assert.deepEqual((await f.request("get_config")).data.configuration.roles, response.data.configuration.roles);
+});
+
+test("OMP role assignments persist to the selected layer without changing the session", async () => {
+  const f = roleFixture();
+  const response = await f.request("configure", { role: "advisor", provider: "test", modelId: "small", thinkingLevel: "off" });
+  assert.equal(response.success, true);
+  assert.equal(f.project.advisor, "test/small:off");
+  assert.equal(f.global.advisor, "test/large:high");
+  assert.deepEqual(f.saves, ["flush"]);
+  assert.deepEqual(f.calls, []);
+  assert.equal(response.data.configuration.modelId, "small");
+  assert.equal(response.data.configuration.roles[1].source, "project");
+  assert.equal((await f.request("configure", { role: "advisor", scope: "global", provider: "test", modelId: "large", thinkingLevel: "max" })).success, true);
+  assert.equal(f.global.advisor, "test/large:max");
+  assert.equal(f.project.advisor, "test/small:off");
+  assert.equal((await f.request("configure", { role: "advisor", scope: "project", clear: true })).success, true);
+  assert.equal(f.project.advisor, undefined);
+  assert.equal(f.controller.configuration().roles[1].thinkingLevel, "max");
+});
+
+test("OMP validates native role names, models, levels, scope and busy state before any persistence", async () => {
+  const f = roleFixture();
+  const selection = { role: "advisor", provider: "test", modelId: "large" };
+  assert.equal((await f.request("configure", { ...selection, role: "guessed" })).error.code, "unsupported_role");
+  assert.equal((await f.request("configure", { ...selection, modelId: "missing" })).error.code, "unavailable_model");
+  assert.equal((await f.request("configure", { ...selection, thinkingLevel: "low" })).error.code, "unsupported_level");
+  assert.equal((await f.request("configure", { ...selection, scope: "other" })).error.code, "invalid_selection");
+  assert.equal((await f.request("configure", { ...selection, clear: true })).error.code, "invalid_selection");
+  f.ctx.isIdle = () => false;
+  assert.equal((await f.request("configure", selection)).error.code, "busy");
+  assert.deepEqual(f.saves, []);
+  assert.deepEqual(f.calls, []);
+});
+
+test("Pi explicitly rejects role changes instead of mutating the session", async () => {
+  const f = fixture();
+  assert.equal((await f.request("configure", { role: "advisor", provider: "test", modelId: "large" })).error.code, "unsupported");
+  assert.deepEqual(f.calls, []);
+});
+
+test("OMP reports persistence failures without leaking settings or claiming success", async () => {
+  const f = roleFixture();
+  f.settings.flush = async () => { throw new Error("secret settings path"); };
+  const result = await f.request("configure", { role: "advisor", scope: "global", provider: "test", modelId: "small" });
+  assert.equal(result.success, false);
+  assert.match(result.error.message, /configuration may have changed/);
+  assert.doesNotMatch(result.error.message, /secret/);
+  assert.equal(f.controller.isConfiguring(), false);
+});
+
+test("native role pools enumerate non-chat models but reject cross-kind and session assignment", async () => {
+  const image = { provider: "test", id: "image", name: "Image", levels: ["off"] };
+  const f = roleFixture({
+    getKnownRoleIds: () => ["advisor", "image"],
+    roleCandidatePool: role => role === "image" ? [image] : [{ provider: "test", id: "large", levels: ["off", "high", "max"] }],
+    getStorage: () => "global",
+  });
+  delete f.settings.get;
+  const response = await f.request("get_models");
+  assert.equal(response.success, true);
+  assert.equal(response.data.configuration.roleStorage, "global");
+  assert.deepEqual(response.data.models.find(model => model.id === "image").roles, ["image"]);
+  assert.equal(response.data.models.find(model => model.id === "image").session, false);
+  assert.equal((await f.request("configure", { role: "advisor", provider: "test", modelId: "image" })).error.code, "unavailable_model");
+  assert.equal((await f.request("configure", { provider: "test", modelId: "image" })).error.code, "unavailable_model");
+  assert.equal((await f.request("configure", { role: "image", provider: "test", modelId: "image" })).success, true);
+  assert.equal(f.global.image, "test/image");
+});
+
+test("incompatible optional role APIs never break hello or session model control", async () => {
+  const f = fixture();
+  const controller = createModelController({ ...f.options, loadRoleControls: async () => { throw new TypeError("missing native API"); } });
+  controller.bindContext(f.ctx);
+  assert.equal(controller.configuration().modelId, "small");
+  const response = await controller.run({ requestId: "r", sessionGuid: "session", operation: "get_models" });
+  assert.equal(response.success, true);
+  assert.equal(response.data.configuration.roles, undefined);
+});
+
+test("native role auto and inherit selectors persist without becoming session selectors", async () => {
+  const f = roleFixture();
+  for (const thinkingLevel of ["auto", "inherit"]) {
+    f.global.advisor = `test/large:${thinkingLevel}`;
+    assert.equal((await f.request("get_models")).data.configuration.roles[1].thinkingLevel, thinkingLevel);
+    const result = await f.request("configure", { role: "advisor", scope: "global", provider: "test", modelId: "large", thinkingLevel });
+    assert.equal(result.success, true);
+    assert.equal(f.global.advisor, `test/large:${thinkingLevel}`);
+    assert.equal((await f.request("configure", { thinkingLevel })).error.code, "unsupported_level");
+  }
+});
+
+test("clearing a configured role needs no available candidate model", async () => {
+  const f = roleFixture();
+  f.ctx.modelRegistry.getAvailable = () => [];
+  const result = await f.request("configure", { role: "advisor", scope: "global", clear: true });
+  assert.equal(result.success, true);
+  assert.equal(f.global.advisor, undefined);
+  assert.deepEqual(f.saves, ["flush"]);
 });

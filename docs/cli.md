@@ -114,10 +114,11 @@ toilet-pi history SESSION --last 6
 toilet-pi history SESSION --since ENTRY_ID --last 100
 ```
 
-History is a **sanitized branch transcript**, not raw persisted entries or reconstructed model context. User/assistant/tool text is included; compaction/branch summaries are labeled transcript rows. Images, thinking, arbitrary tool details, custom state, and model/auth metadata are omitted. `retainedTail` is not expanded because its original transcript messages already occur on the ancestor path; this avoids duplication and does not claim to reproduce compacted model context.
+History is a **sanitized branch transcript**, not raw persisted entries or reconstructed model context. User/assistant/tool text and bounded raster image attachments are included; compaction/branch summaries are labeled transcript rows. Thinking, arbitrary tool details, custom state, and model/auth metadata are omitted. The browser displays attachments; the plain-text CLI does not render image pixels. `retainedTail` is not expanded because its original transcript messages already occur on the ancestor path; this avoids duplication and does not claim to reproduce compacted model context.
 
 - Active sessions: fresh `sessionManager.getBranch()` from the exact owning runner.
 - Inactive sessions: supervisor reads the catalogued file without launching a process and follows `id`/`parentId` from the **last persisted leaf**, matching Pi's reload behavior. Unpersisted in-memory tree navigation can only be known by the active runner.
+- Native OMP `blob:sha256:` images are loaded from configured runtime blob stores, with bounded reads, matching hashes, and raster signatures. Missing or invalid blobs mark paginated history incomplete; raw blob paths are never sent to clients.
 - File identity is checked against the requested session. A malformed/partial JSONL record, broken/cyclic parent chain, or concurrently changed file marks the result incomplete. Abandoned branches are not mixed into the transcript.
 - Requests emit correlated `control_progress: loading`; failures return an explicit correlated error, never a fabricated empty complete history.
 
@@ -125,7 +126,7 @@ Output includes source, sanitized/completeness/truncation flags, leaf ID, entry 
 
 `complete=true` means the entire supported sanitized transcript fit in this response and the source was not detected as partial—not that all raw fields/entry types were exported. Normal pagination can make `complete=false` without source truncation. `truncated=true` reports source/text loss. Pagination omissions are indicated by the cursor/window and `more` flag.
 
-Bounds: 1..1000 rows/request (default 100), 50 KiB per text, approximately 1 MiB/page. Inactive reads reject files over 64 MiB or 200,000 entries; at most four concurrent supervisor reads. CLI rendering strips terminal controls and folds multiline rows to compact plain text. The older browser mirror/status cache is separately bounded and makes no transcript completeness claim.
+Bounds: 1..1000 rows/request (default 100), 50 KiB per text, approximately 4 MiB/page. Each message can contain up to four JPEG/PNG/WebP/GIF attachments of at most 512 KiB each before base64 encoding. Inactive reads reject files over 64 MiB or 200,000 entries; at most four concurrent supervisor reads. CLI rendering strips terminal controls and folds multiline rows to compact plain text. The browser mirror/status cache is separately bounded and makes no transcript completeness claim.
 
 ## Scoped orchestrator tokens
 
@@ -149,15 +150,23 @@ The broker filters discovery and all session broadcasts, rechecks authorization,
 
 **Scopes are not a sandbox.** `input` can instruct an agent to use its normal tools; `start` can launch on a permitted host in a caller-selected directory. Grant only to trusted orchestrators.
 
-## Browser model/thinking controls
+## Browser model and role controls
 
-Expand **Session model / thinking**, load models, choose a supported pair, then apply. The browser uses the same model-control request channel as the CLI. Busy/queued/inactive/disconnected sessions disable mutation. Responses are bound to the selected session/request; switching sessions, timeouts, and disconnects discard stale selection state. Errors are shown without automatic retry. Native selection/configuration events update the displayed state. Server/runtime validation remains authoritative.
+Expand **Models & roles**, load models, select **Current session**, choose a supported model/thinking pair, then apply. The browser uses the same model-control request channel as the CLI. Busy/queued/inactive/disconnected sessions disable mutation. Responses are bound to the selected session/request; switching sessions, timeouts, and disconnects discard stale selection state. Errors are shown without automatic retry. Native selection/configuration events update the displayed state. Server/runtime validation remains authoritative.
+
+OMP also exposes its native roles, including advisor and configured custom roles. Choose a role and global/project scope to save or reset its assignment. The runtime supplies each role's compatible models; role-only image or speech models cannot become session chat models. Project overrides take precedence over global assignments. Role saves affect future uses of that role; selecting the Default role does not replace the current session model.
+
+Persistent role mutation is admin-only. Scoped orchestrator tokens retain session-only `configure` access. Role `configure` adds `role`, `scope: "global" | "project"` and optionally `thinkingLevel` (including native `auto`/`inherit` selectors). Reset sends `clear: true` without model/thinking fields. Configuration responses include sanitized `roles` and `roleStorage`; no provider headers, raw settings, or credentials are sent.
+
+Existing OMP runners must restart and resume their saved session to load updated extension code. `/reload-plugins` in OMP 18.8.7 does not reload extension factories.
 
 ## Wire capabilities and compatibility
 
 The broker advertises `orchestration_v1` and `scoped_tokens_v1` in `overview.capabilities`.
 
 - Runner `model_control_v1`: existing `session_request`/`session_response`, operations `get_models`, `get_config`, `configure`.
+- Runner `model_roles_v1`: native OMP role enumeration and admin-only persistent role configuration.
+- Runner `image_input_v1`: browser `input` accepts optional `images: [{type: "image", mimeType, data}]`, where `data` is base64. Text can be empty when images are present. Old runners reject the entire image-bearing input. Browser drafts remain until the matching runtime user-message event confirms receipt.
 - Runner `input_tracking_v1`: `control_command` for tracked send/abort/terminate and `session_event.input_status`.
 - Runner `agent_settled_v1`: settlement waits enabled. Currently gated on optional event registration and the known Pi 0.85.1+ (0.x) API generation. Missing/unknown runtime versions are conservative; no busy/idle completion emulation.
 - Runner/supervisor `history_v1`: fresh correlated branch reads.
@@ -174,8 +183,8 @@ Example client request:
 | --- | --- |
 | Pi 0.85.1 | Installed docs/source inspected; actual extension exercised with injected fake APIs and isolated socket |
 | Older/missing APIs | Mocked unsupported/event-rejection behavior; no guessed model level table or completion |
-| OMP | Shared entrypoint/scanning/launch-argument tests; native new capability behavior **not certified** (runtime not installed locally) |
-| Node | Real CLI + HTTP/auth + WebSocket + broker + fake runner E2E |
+| OMP 18.8.7 | Actual native model/role enumeration, session model/thinking changes, project role save/reset, and image prompts exercised through Node and the mobile browser |
+| Node | Real CLI/auth/WebSocket E2E plus native OMP mobile smoke; search exercised against the live session catalogue |
 | Cloudflare | Shared core/transport reconnect tests and Worker token endpoint tests; no live deployment |
 
 ## Exit codes and isolated verification

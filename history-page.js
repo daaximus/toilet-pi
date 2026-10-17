@@ -1,3 +1,5 @@
+import { getMessageImages } from "./server/public/image-attachments.js";
+
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const MAX_TEXT_BYTES = 50 * 1024;
@@ -22,8 +24,10 @@ export function buildHistoryPage(entries, { source = "runtime-branch", complete 
     const bytes = encoder.encode(text);
     if (bytes.length > MAX_TEXT_BYTES) { text = decoder.decode(bytes.slice(0, MAX_TEXT_BYTES)) + "\n[truncated]"; truncated = true; }
     const timestamp = typeof raw.timestamp === "number" ? raw.timestamp : Date.parse(entry.timestamp);
+    const images = raw.role === "user" ? getMessageImages(raw.content) : undefined;
     messages.push({ role: raw.role, text, ...(entry.id ? { entryId: entry.id } : {}),
       ...(Number.isFinite(timestamp) ? { timestamp } : {}),
+      ...(images ? { images } : {}),
       ...(raw.role === "assistant" && raw.stopReason ? { stopReason: raw.stopReason } : {}),
       ...(raw.role === "toolResult" ? { toolName: raw.toolName || "tool", isError: !!raw.isError } : {}),
     });
@@ -38,7 +42,7 @@ export function buildHistoryPage(entries, { source = "runtime-branch", complete 
   let bytes = 0;
   for (const message of messages.slice(start, start + last)) {
     const size = encoder.encode(JSON.stringify(message)).length;
-    if (bytes + size > 1024 * 1024) break;
+    if (bytes + size > 4 * 1024 * 1024) break;
     bytes += size; page.push(message);
   }
   const hasMore = start + page.length < messages.length;

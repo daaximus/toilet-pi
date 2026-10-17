@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { readFile, mkdir, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
+import { BlockList, isIP } from 'node:net'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { WebSocketServer, type WebSocket } from 'ws'
@@ -24,6 +25,8 @@ import { createNodeTransport } from './transport.js'
 const PORT = Number.parseInt(process.env.PORT || '3457', 10)
 const WS_PATH = process.env.TOILET_PI_WS_PATH || '/ws'
 const PUBLIC_URL = process.env.TOILET_PI_PUBLIC_URL || `http://localhost:${PORT}`
+const HOST = process.env.TOILET_PI_HOST || undefined
+const ALLOWED_CLIENTS = parseAllowedClients(process.env.TOILET_PI_ALLOWED_CLIENTS)
 const PUBLIC_SERVER_URL = getPublicServerUrl(PUBLIC_URL, WS_PATH)
 const PUBLIC_DIR = fileURLToPath(new URL('../../public/', import.meta.url))
 const SERVER_TOKEN = await ensureServerToken()
@@ -87,12 +90,26 @@ const server = createServer(async (req, res) => {
     }
 
     const content = await readFile(filePath)
-    sendBuffer(res, 200, content, getContentType(filePath))
+    // No ETag/Last-Modified is emitted, so without this browsers (notably a
+    // home-screen PWA on a plain-http LAN origin) heuristically cache app.js
+    // and index.html and keep serving a stale UI after server updates.
+    sendBuffer(res, 200, content, getContentType(filePath), { cacheControl: 'no-cache' })
   } catch (error) {
     log(
       `http request failed: ${error instanceof Error ? error.message : String(error)}`,
     )
     sendText(res, 500, 'Internal server error')
+  }
+})
+
+// TCP-level source gate: covers HTTP and WebSocket upgrades before any parsing.
+// A router port-forward (DNAT) preserves the WAN source address, so this rejects
+// non-LAN peers even though the listener is reachable through the forward.
+server.on('connection', (socket) => {
+  const remote = socket.remoteAddress || ''
+  if (!isAllowedClient(remote)) {
+    log(`rejected connection from ${remote}: not in TOILET_PI_ALLOWED_CLIENTS`)
+    socket.destroy()
   }
 })
 
@@ -163,10 +180,12 @@ wss.on('connection', (ws, req) => {
   })
 })
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
   console.log('='.repeat(60))
   console.log('toilet-pi server')
   console.log('='.repeat(60))
+  console.log(`Listening on: ${HOST ?? 'all interfaces'}:${PORT}`)
+  console.log(`Allowed clients: ${process.env.TOILET_PI_ALLOWED_CLIENTS || 'any'}`)
   console.log(`Web UI: ${PUBLIC_URL}`)
   console.log(`WebSocket: ${PUBLIC_SERVER_URL}`)
   console.log(`Admin login URL: ${buildAdminUrl(PUBLIC_SERVER_URL, SERVER_TOKEN)}`)
@@ -317,6 +336,41 @@ function getContentType(filePath: string): string {
   if (filePath.endsWith('.svg')) return 'image/svg+xml'
   if (filePath.endsWith('.png')) return 'image/png'
   return 'text/plain; charset=utf-8'
+}
+
+// TOILET_PI_ALLOWED_CLIENTS: comma-separated IPs or CIDRs (e.g. "192.168.4.0/22,10.0.0.5").
+// Unset or empty means every source is accepted (upstream behaviour).
+function parseAllowedClients(value: string | undefined): BlockList | null {
+  const entries = String(value || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+  if (entries.length === 0) return null
+  const list = new BlockList()
+  for (const entry of entries) {
+    const [address, prefix] = entry.split('/')
+    const family = isIP(address)
+    if (!family) throw new Error(`TOILET_PI_ALLOWED_CLIENTS: invalid address "${entry}"`)
+    const type = family === 6 ? 'ipv6' : 'ipv4'
+    if (prefix === undefined) {
+      list.addAddress(address, type)
+      continue
+    }
+    const bits = Number.parseInt(prefix, 10)
+    const maxBits = family === 6 ? 128 : 32
+    if (!Number.isInteger(bits) || bits < 0 || bits > maxBits) {
+      throw new Error(`TOILET_PI_ALLOWED_CLIENTS: invalid prefix "${entry}"`)
+    }
+    list.addSubnet(address, bits, type)
+  }
+  return list
+}
+
+function isAllowedClient(remoteAddress: string): boolean {
+  if (!ALLOWED_CLIENTS) return true
+  const family = isIP(remoteAddress)
+  if (!family) return false
+  return ALLOWED_CLIENTS.check(remoteAddress, family === 6 ? 'ipv6' : 'ipv4')
 }
 
 function getPublicServerUrl(publicUrl: string, wsPath: string): string {

@@ -1,6 +1,7 @@
 import { groupCollapsedHistory } from "./history-grouping.js";
 import { renderMarkdown } from "./markdown.js";
 import { createModelPicker } from "./model-picker.js";
+import { appendImages, createImageComposer } from "./image-attachments.js";
 
 const MOBILE_MEDIA = window.matchMedia("(max-width: 900px)");
 
@@ -38,6 +39,8 @@ const sidebarSummaryEl = document.getElementById("sidebar-summary");
 const sidebarScrimEl = document.getElementById("sidebar-scrim");
 const connectionStatusEl = document.getElementById("connection-status");
 const browserListEl = document.getElementById("browser-list");
+const browserSearchEl = document.getElementById("browser-search");
+const browserSearchClearEl = document.getElementById("browser-search-clear");
 const installationPanelEl = document.getElementById("installation-panel");
 const installationBtnEl = document.getElementById("installation-btn");
 const authModalScrimEl = document.getElementById("auth-modal-scrim");
@@ -70,6 +73,21 @@ const toggleLiveTurnDetailsBtnEl = document.getElementById("toggle-live-turn-det
 const newSessionBtnEl = document.getElementById("new-session-btn");
 const newSessionFabEl = document.getElementById("new-session-fab");
 const killSessionBtnEl = document.getElementById("kill-session-btn");
+const newSessionFolderBtnEl = document.getElementById("new-session-folder-btn");
+const folderModalScrimEl = document.getElementById("folder-modal-scrim");
+const folderCloseBtnEl = document.getElementById("folder-close-btn");
+const folderCancelBtnEl = document.getElementById("folder-cancel-btn");
+const folderStartBtnEl = document.getElementById("folder-start-btn");
+const folderHostSelectEl = document.getElementById("folder-host-select");
+const folderUpBtnEl = document.getElementById("folder-up-btn");
+const folderPathInputEl = document.getElementById("folder-path-input");
+const folderGoBtnEl = document.getElementById("folder-go-btn");
+const folderRootsEl = document.getElementById("folder-roots");
+const folderEntriesEl = document.getElementById("folder-entries");
+const folderNewNameEl = document.getElementById("folder-new-name");
+const folderCreateBtnEl = document.getElementById("folder-create-btn");
+const folderStatusEl = document.getElementById("folder-status");
+const questionCardEl = document.getElementById("question-card");
 const noticeBarEl = document.getElementById("notice-bar");
 const messagesEl = document.getElementById("messages");
 const messagesContentEl = document.getElementById("messages-content");
@@ -79,6 +97,13 @@ const workingPlaceholderMetaEl = document.getElementById("working-placeholder-me
 const messageInputEl = document.getElementById("message-input");
 const sendBtnEl = document.getElementById("send-btn");
 const abortBtnEl = document.getElementById("abort-btn");
+const imageComposer = createImageComposer({
+	picker: document.getElementById("image-picker"),
+	button: document.getElementById("attach-image-btn"),
+	previews: document.getElementById("attachment-previews"),
+	report: showNotice,
+});
+let pendingImageInput = null;
 const modelPickerRoot = document.getElementById("model-picker");
 const modelPicker = modelPickerRoot ? createModelPicker({ root: modelPickerRoot, send,
 	getSession: () => currentSession, notify: showNotice, label: document.getElementById("model-picker-label") }) : { receive() {}, sync() {} };
@@ -330,6 +355,7 @@ function connect() {
 		console.warn(`toilet-pi WebSocket closed: code=${event.code} reason=${event.reason || "none"}`);
 		ws = null;
 		setConnection(false);
+		if (pendingImageInput) releaseImageInput("Connection lost before image delivery was confirmed. Your draft is retained; check history before retrying.");
 		if (!opened) {
 			await refreshAuthState({
 				connectWhenAuthenticated: false,
@@ -379,6 +405,7 @@ function flushScheduledSessionUiRefresh() {
 	scheduledSessionUiHeader = false;
 	scheduledSessionUiControls = false;
 	renderSession({ forceScroll: nextForceScroll });
+	renderQuestionCard();
 	if (nextHeader) updateHeader();
 	if (nextControls) updateControls();
 }
@@ -396,7 +423,40 @@ function scheduleSessionUiRefresh({ forceScroll = false, header = true, controls
 	}, delay);
 }
 
+function releaseImageInput(error) {
+	if (!pendingImageInput) return;
+	clearTimeout(pendingImageInput.timer);
+	pendingImageInput = null;
+	if (error) showNotice(error, "error");
+}
+
+function receiveImageInput(message) {
+	const pending = pendingImageInput;
+	if (!pending) return;
+	if (message.type === "error") {
+		releaseImageInput();
+		return;
+	}
+	if (message.type !== "session_event" || message.sessionGuid !== pending.sessionGuid) return;
+	const event = message.event;
+	if (event.type === "remote_input_failed" && event.inputId === pending.inputId) {
+		releaseImageInput(event.message || "Image delivery failed. Your draft is retained.");
+	} else if (event.type === "message" && event.message?.remoteInputId === pending.inputId) {
+		const received = event.message.images;
+		if (!Array.isArray(received) || received.length !== pending.images.length ||
+			received.some((image, index) => image.mimeType !== pending.images[index].mimeType || image.data !== pending.images[index].data)) {
+			releaseImageInput("The runtime did not confirm all images. Your draft is retained; inspect history before retrying.");
+			return;
+		}
+		const images = imageComposer.getImages();
+		if (images.length === pending.images.length && images.every((image, index) => image === pending.images[index])) imageComposer.clear();
+		if (messageInputEl.value === pending.text) messageInputEl.value = "";
+		releaseImageInput();
+	}
+}
+
 function handleMessage(message) {
+	receiveImageInput(message);
 	modelPicker.receive(message);
 	switch (message.type) {
 		case "session_response":
@@ -423,6 +483,7 @@ function handleMessage(message) {
 			currentSession = normalizeSession(message.session);
 			hydrateCurrentSessionFromOverview();
 			renderSession({ forceScroll: shouldScroll });
+			renderQuestionCard();
 			updateHeader();
 			updateControls();
 			break;
@@ -482,6 +543,10 @@ function handleMessage(message) {
 			}
 			break;
 		}
+
+		case "directory_listing":
+			handleDirectoryListing(message);
+			break;
 
 		case "notice":
 			showNotice(message.message || "Notice", message.level || "info");
@@ -748,6 +813,132 @@ function closeConfirmModal() {
 	bodyEl.classList.remove("confirm-open");
 }
 
+// Folder picker: browse a connected host's filesystem, optionally create a
+// folder, then start a new background session there. One request in flight at
+// a time; a stale response (different requestId) is ignored.
+const folderPicker = { hostId: null, path: null, parent: null, requestId: null };
+
+function connectedHosts() {
+	return hosts.filter((host) => host.connected);
+}
+
+function openFolderModal() {
+	const available = connectedHosts();
+	if (!available.length) {
+		showNotice("No connected computers", "error");
+		return;
+	}
+	closeHeaderMenu();
+	const context = getCurrentLaunchContext();
+	const preferred = available.find((host) => host.hostId === context?.hostId) || available[0];
+	folderHostSelectEl.innerHTML = "";
+	for (const host of available) {
+		const option = document.createElement("option");
+		option.value = host.hostId;
+		option.textContent = host.hostname || host.hostId;
+		folderHostSelectEl.append(option);
+	}
+	folderHostSelectEl.value = preferred.hostId;
+	folderNewNameEl.value = "";
+	bodyEl.classList.add("folder-open");
+	browseFolder(preferred.hostId, context?.hostId === preferred.hostId ? context.cwd : null);
+}
+
+function closeFolderModal() {
+	bodyEl.classList.remove("folder-open");
+	folderPicker.requestId = null;
+}
+
+function sendFolderRequest(message) {
+	const requestId = createId();
+	folderPicker.requestId = requestId;
+	folderPicker.hostId = message.hostId;
+	folderStatusEl.textContent = message.type === "create_directory" ? "Creating…" : "Loading…";
+	folderStartBtnEl.disabled = true;
+	folderCreateBtnEl.disabled = true;
+	if (!send({ ...message, requestId })) {
+		folderPicker.requestId = null;
+		folderStatusEl.textContent = "Not connected";
+	}
+}
+
+function browseFolder(hostId, path) {
+	sendFolderRequest({ type: "browse_directory", hostId, path: path || null });
+}
+
+function handleDirectoryListing(message) {
+	if (message.requestId !== folderPicker.requestId) return;
+	folderPicker.requestId = null;
+	folderCreateBtnEl.disabled = false;
+	if (message.error) {
+		folderStatusEl.textContent = message.error;
+		folderStartBtnEl.disabled = !folderPicker.path;
+		return;
+	}
+	folderPicker.path = message.path;
+	folderPicker.parent = message.parent ?? null;
+	folderPathInputEl.value = message.path;
+	folderUpBtnEl.disabled = !message.parent;
+	folderStartBtnEl.disabled = false;
+	renderFolderRoots(message.roots || []);
+	renderFolderEntries(message.entries || []);
+	folderStatusEl.textContent = `${(message.entries || []).length} subfolder${(message.entries || []).length === 1 ? "" : "s"}`;
+}
+
+function renderFolderRoots(roots) {
+	folderRootsEl.innerHTML = "";
+	if (roots.length < 2) return;
+	for (const root of roots) {
+		const button = document.createElement("button");
+		button.type = "button";
+		button.className = "subtle";
+		button.textContent = root;
+		button.onclick = () => browseFolder(folderPicker.hostId, root);
+		folderRootsEl.append(button);
+	}
+}
+
+function renderFolderEntries(entries) {
+	folderEntriesEl.innerHTML = "";
+	if (!entries.length) {
+		const empty = document.createElement("div");
+		empty.className = "auth-copy";
+		empty.textContent = "No subfolders";
+		folderEntriesEl.append(empty);
+		return;
+	}
+	for (const entry of entries) {
+		const button = document.createElement("button");
+		button.type = "button";
+		button.className = "subtle";
+		button.setAttribute("role", "option");
+		button.textContent = entry.name;
+		button.title = entry.path;
+		button.onclick = () => browseFolder(folderPicker.hostId, entry.path);
+		folderEntriesEl.append(button);
+	}
+}
+
+function createFolderInPicker() {
+	const name = folderNewNameEl.value.trim();
+	if (!name || !folderPicker.path) return;
+	if (/[\\/]/.test(name) || name === "." || name === "..") {
+		folderStatusEl.textContent = "Folder name cannot contain path separators";
+		return;
+	}
+	const separator = folderPicker.path.includes("\\") ? "\\" : "/";
+	const base = folderPicker.path.replace(/[\\/]+$/, "");
+	sendFolderRequest({ type: "create_directory", hostId: folderPicker.hostId, path: `${base}${separator}${name}` });
+	folderNewNameEl.value = "";
+}
+
+function startSessionFromPicker() {
+	if (!folderPicker.hostId || !folderPicker.path) return;
+	const host = hosts.find((entry) => entry.hostId === folderPicker.hostId);
+	closeFolderModal();
+	createNewBackgroundSession({ hostId: folderPicker.hostId, hostname: host?.hostname || null, cwd: folderPicker.path });
+}
+
 function flattenSessions() {
 	const list = [];
 	for (const host of hosts) {
@@ -795,6 +986,26 @@ function buildProjects() {
 	return projects;
 }
 
+function matchesBrowserSearch(...values) {
+	const query = browserSearchEl.value.trim().toLocaleLowerCase();
+	return !query || values.some(value => typeof value === "string" && value.toLocaleLowerCase().includes(query));
+}
+
+function matchesSessionSearch(session) {
+	return matchesBrowserSearch(session.sessionName, session.preview, session.cwd);
+}
+
+browserSearchEl.addEventListener("input", () => {
+	browserSearchClearEl.hidden = !browserSearchEl.value;
+	renderBrowserList();
+});
+browserSearchClearEl.addEventListener("click", () => {
+	browserSearchEl.value = "";
+	browserSearchClearEl.hidden = true;
+	renderBrowserList();
+	browserSearchEl.focus();
+});
+
 function renderBrowserList() {
 	browserListEl.innerHTML = "";
 	if (currentView === "projects") {
@@ -805,9 +1016,11 @@ function renderBrowserList() {
 }
 
 function renderSessionBrowser() {
-	const sessions = flattenSessions();
+	const sessions = flattenSessions().filter(matchesSessionSearch);
 	if (sessions.length === 0) {
-		browserListEl.appendChild(renderEmpty("No sessions visible yet. Start pi with the websocket extension, or run the host supervisor to discover inactive local sessions."));
+		browserListEl.appendChild(renderEmpty(browserSearchEl.value.trim()
+			? "No sessions match your search."
+			: "No sessions visible yet. Start pi with the websocket extension, or run the host supervisor to discover inactive local sessions."));
 		return;
 	}
 
@@ -843,9 +1056,14 @@ function renderSessionBrowser() {
 }
 
 function renderProjectBrowser() {
-	const projects = buildProjects();
+	const projects = buildProjects().map(project => matchesBrowserSearch(project.cwd)
+		? project
+		: { ...project, sessions: project.sessions.filter(matchesSessionSearch) })
+		.filter(project => project.sessions.length > 0);
 	if (projects.length === 0) {
-		browserListEl.appendChild(renderEmpty("No project folders are visible yet. Live sessions and supervisor-discovered sessions will appear here grouped by project."));
+		browserListEl.appendChild(renderEmpty(browserSearchEl.value.trim()
+			? "No projects or sessions match your search."
+			: "No project folders are visible yet. Live sessions and supervisor-discovered sessions will appear here grouped by project."));
 		return;
 	}
 
@@ -918,7 +1136,8 @@ function buildSessionBadges(session) {
 		badges.push(createBadge("offline", "disconnected"));
 	}
 	badges.push(createBadge(session.owner || "inactive", session.owner || "inactive"));
-	if (session.busy) badges.push(createBadge("busy", "busy"));
+	if (session.pendingQuestion) badges.push(createBadge("requires input", "question"));
+	else if (session.busy) badges.push(createBadge("busy", "busy"));
 	if (session.queuedInputCount > 0) badges.push(createBadge(`${session.queuedInputCount} queued`, "queued"));
 	return badges;
 }
@@ -1166,7 +1385,9 @@ function formatCollapsedHistoryToolSummaryText(count, errorCount) {
 
 function renderMessage(message) {
 	if (message.role === "user") {
-		return buildMessageElement("user", message.text || "", message.timestamp);
+		const row = buildMessageElement("user", message.text || "", message.timestamp);
+		appendImages(row.querySelector(".message") || row, message.images);
+		return row;
 	}
 	if (message.role === "assistant") {
 		return buildMessageElement(
@@ -1188,12 +1409,14 @@ function renderMessage(message) {
 
 function renderQueuedInput(queuedInput) {
 	const isLocalTuiPlaceholder = queuedInput?.inputId === "__local_pending__";
-	return buildMessageElement(
+	const row = buildMessageElement(
 		"user queued",
 		isLocalTuiPlaceholder ? "Queued in local pi TUI" : (queuedInput?.text || ""),
 		queuedInput?.timestamp || null,
 		isLocalTuiPlaceholder ? "local queue" : "queued",
 	);
+	appendImages(row.querySelector(".message") || row, queuedInput?.images);
+	return row;
 }
 
 function shouldRenderWorkingPlaceholder(summary) {
@@ -1207,7 +1430,7 @@ function shouldRenderWorkingPlaceholder(summary) {
 
 function updateWorkingPlaceholder(summary, visible) {
 	if (!workingPlaceholderLabelEl || !workingPlaceholderMetaEl) return;
-	workingPlaceholderLabelEl.textContent = visible ? "Working…" : "Working...";
+	workingPlaceholderLabelEl.textContent = currentSession.pendingQuestion ? "Waiting for your answer…" : visible ? "Working…" : "Working...";
 	const meta = visible ? getWorkingPlaceholderMeta(summary) : null;
 	workingPlaceholderMetaEl.textContent = meta?.label || "";
 	workingPlaceholderMetaEl.title = meta?.title || "";
@@ -1932,11 +2155,111 @@ function updateHeader() {
 		? clampText(sessionLabel && sessionLabel !== projectLabel ? `${projectLabel} — ${sessionLabel}` : projectLabel, 120)
 		: clampText(sessionLabel, 120);
 	const working = isSessionWorking(summary);
+	const status = currentSession.pendingQuestion ? " • requires input" : working ? " • working" : "";
 
 	sessionTitleEl.textContent = title;
-	sessionSubtitleEl.textContent = `${owner}${working ? " • working" : ""}${queued} • ${model} • ${hostname} • ${cwd}`;
+	sessionSubtitleEl.textContent = `${owner}${status}${queued} • ${model} • ${hostname} • ${cwd}`;
 	sessionPathEl.textContent = cwd;
 	sessionWorkingIndicatorEl?.classList.remove("visible");
+}
+
+// Question card: rendered for the attached session's pending `ask` call.
+// Re-rendering replaces the form only when the question identity changes so
+// in-progress selections survive unrelated session events.
+function renderQuestionCard() {
+	const question = currentSessionGuid ? currentSession.pendingQuestion : null;
+	if (!question) {
+		questionCardEl.hidden = true;
+		questionCardEl.dataset.questionId = "";
+		questionCardEl.innerHTML = "";
+		return;
+	}
+	if (questionCardEl.dataset.questionId === question.questionId && !questionCardEl.hidden) return;
+	questionCardEl.dataset.questionId = question.questionId;
+	questionCardEl.innerHTML = "";
+
+	const heading = document.createElement("h4");
+	heading.textContent = question.questions.length === 1 ? "The agent needs your input" : `The agent needs your input (${question.questions.length} questions)`;
+	questionCardEl.append(heading);
+
+	for (const item of question.questions) {
+		const block = document.createElement("div");
+		block.className = "question-block";
+		block.dataset.questionItemId = item.id;
+		block.dataset.multi = item.multi ? "1" : "";
+		const text = document.createElement("div");
+		text.className = "question-text";
+		text.textContent = item.header ? `${item.header}: ${item.question}` : item.question;
+		block.append(text);
+		const inputType = item.multi ? "checkbox" : "radio";
+		const groupName = `q-${question.questionId}-${item.id}`;
+		item.options.forEach((option, index) => {
+			const label = document.createElement("label");
+			label.className = "question-option";
+			const input = document.createElement("input");
+			input.type = inputType;
+			input.name = groupName;
+			input.value = option.label;
+			if (!item.multi && item.recommended === index) input.checked = true;
+			const copy = document.createElement("div");
+			copy.className = "question-option-copy";
+			const title = document.createElement("span");
+			title.textContent = item.recommended === index ? `${option.label} (Recommended)` : option.label;
+			copy.append(title);
+			if (option.description) {
+				const desc = document.createElement("span");
+				desc.className = "question-option-desc";
+				desc.textContent = option.description;
+				copy.append(desc);
+			}
+			label.append(input, copy);
+			block.append(label);
+		});
+		const custom = document.createElement("input");
+		custom.type = "text";
+		custom.className = "question-custom";
+		custom.placeholder = "Other (type your own)";
+		custom.autocomplete = "off";
+		custom.dataset.custom = "1";
+		custom.oninput = () => {
+			if (!custom.value.trim()) return;
+			for (const choice of block.querySelectorAll("input[type=radio]")) choice.checked = false;
+		};
+		block.append(custom);
+		questionCardEl.append(block);
+	}
+
+	const actions = document.createElement("div");
+	actions.className = "question-actions";
+	const submit = document.createElement("button");
+	submit.type = "submit";
+	submit.className = "primary";
+	submit.textContent = "Answer";
+	actions.append(submit);
+	questionCardEl.append(actions);
+	questionCardEl.hidden = false;
+}
+
+function submitQuestionAnswers(event) {
+	event.preventDefault();
+	const question = currentSession.pendingQuestion;
+	if (!question || !currentSessionGuid) return;
+	const answers = [];
+	for (const block of questionCardEl.querySelectorAll(".question-block")) {
+		const id = block.dataset.questionItemId;
+		const customInput = block.querySelector("input[data-custom]")?.value.trim() || "";
+		const selectedOptions = [...block.querySelectorAll("input[type=radio]:checked, input[type=checkbox]:checked")].map((input) => input.value);
+		if (!customInput && !selectedOptions.length && !block.dataset.multi) {
+			showNotice("Pick an option or type an answer for every question", "error");
+			return;
+		}
+		answers.push({ id, selectedOptions: customInput ? [] : selectedOptions, ...(customInput ? { customInput } : {}) });
+	}
+	if (!send({ type: "answer_question", sessionGuid: currentSessionGuid, questionId: question.questionId, answers })) {
+		showNotice("Not connected", "error");
+		return;
+	}
+	questionCardEl.querySelector("button[type=submit]").disabled = true;
 }
 
 function updateControls() {
@@ -2127,6 +2450,10 @@ function applySessionEvent(session, event) {
 			break;
 		}
 
+		case "question":
+			session.pendingQuestion = event.question || null;
+			break;
+
 		case "queued_input_add":
 			if (event.queuedInput?.inputId) {
 				const existingIndex = session.queuedInputs.findIndex((entry) => entry.inputId === event.queuedInput.inputId);
@@ -2200,6 +2527,7 @@ function createEmptySession(sessionGuid) {
 		streamingThinkingText: null,
 		activeTools: [],
 		queuedInputs: [],
+		pendingQuestion: null,
 		abortRequested: false,
 	};
 }
@@ -2233,6 +2561,7 @@ function normalizeSession(session) {
 		streamingThinkingText: typeof session?.streamingThinkingText === "string" ? session.streamingThinkingText : null,
 		activeTools: Array.isArray(session?.activeTools) ? session.activeTools : [],
 		queuedInputs: Array.isArray(session?.queuedInputs) ? session.queuedInputs : [],
+		pendingQuestion: session?.pendingQuestion && typeof session.pendingQuestion === "object" ? session.pendingQuestion : null,
 		abortRequested: false,
 	};
 }
@@ -2350,6 +2679,7 @@ viewSessionsBtnEl.onclick = () => {
 	renderBrowserList();
 	updateControls();
 };
+questionCardEl.onsubmit = (event) => submitQuestionAnswers(event);
 
 viewProjectsBtnEl.onclick = () => {
 	currentView = "projects";
@@ -2422,7 +2752,7 @@ if (toggleLiveTurnDetailsBtnEl) {
 function triggerNewSession() {
 	const context = getCurrentLaunchContext();
 	if (!context) {
-		showNotice("Select a project first", "error");
+		openFolderModal();
 		return;
 	}
 	closeHeaderMenu();
@@ -2431,6 +2761,31 @@ function triggerNewSession() {
 
 newSessionBtnEl.onclick = () => triggerNewSession();
 if (newSessionFabEl) newSessionFabEl.onclick = () => triggerNewSession();
+newSessionFolderBtnEl.onclick = () => openFolderModal();
+folderCloseBtnEl.onclick = () => closeFolderModal();
+folderCancelBtnEl.onclick = () => closeFolderModal();
+folderModalScrimEl.onclick = (event) => {
+	if (event.target === folderModalScrimEl) closeFolderModal();
+};
+folderHostSelectEl.onchange = () => browseFolder(folderHostSelectEl.value, null);
+folderUpBtnEl.onclick = () => {
+	if (folderPicker.parent) browseFolder(folderPicker.hostId, folderPicker.parent);
+};
+folderGoBtnEl.onclick = () => browseFolder(folderPicker.hostId, folderPathInputEl.value.trim() || null);
+folderPathInputEl.onkeydown = (event) => {
+	if (event.key === "Enter") {
+		event.preventDefault();
+		folderGoBtnEl.onclick();
+	}
+};
+folderCreateBtnEl.onclick = () => createFolderInPicker();
+folderNewNameEl.onkeydown = (event) => {
+	if (event.key === "Enter") {
+		event.preventDefault();
+		createFolderInPicker();
+	}
+};
+folderStartBtnEl.onclick = () => startSessionFromPicker();
 if (killSessionBtnEl) {
 	killSessionBtnEl.onclick = () => {
 		if (!currentSessionGuid) return;
@@ -2439,17 +2794,31 @@ if (killSessionBtnEl) {
 }
 
 sendBtnEl.onclick = () => {
+	if (imageComposer.isPreparing()) return showNotice("Wait for images to finish loading", "info");
+	if (pendingImageInput) return showNotice("Waiting for image delivery. Your draft is retained until the runtime confirms receipt.", "info");
 	const text = messageInputEl.value.trim();
-	if (!text || !currentSessionGuid) return;
+	const images = imageComposer.getImages();
+	if ((!text && !images.length) || !currentSessionGuid) return;
 	closeHeaderMenu();
-	const sent = send({ type: "input", sessionGuid: currentSessionGuid, text });
-	if (!sent) return;
+	const inputId = `web-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+	let sent = false;
+	try {
+		sent = send({ type: "input", sessionGuid: currentSessionGuid, text, inputId, ...(images.length ? { images } : {}) });
+	} catch (error) {
+		return showNotice(`Could not send: ${error.message}. Your draft is retained.`, "error");
+	}
+	if (!sent) return showNotice("Not connected. Your draft is retained.", "error");
+	if (images.length) {
+		pendingImageInput = { inputId, sessionGuid: currentSessionGuid, text: messageInputEl.value, images,
+			timer: setTimeout(() => releaseImageInput("Image delivery has not been confirmed. Your draft is retained; check history before retrying."), 120000) };
+		showNotice("Sending images; the draft will clear when the runtime confirms receipt.", "info");
+	}
 	stickToBottom = true;
 	requestAnimationFrame(() => scrollMessagesToBottom());
 	if (!(currentSession.owner || findSessionSummary(currentSessionGuid)?.owner)) {
 		showNotice("Starting background runner and delivering your message…", "info");
 	}
-	messageInputEl.value = "";
+	if (!images.length) messageInputEl.value = "";
 };
 
 abortBtnEl.onclick = () => {

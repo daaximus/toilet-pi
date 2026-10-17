@@ -1,3 +1,11 @@
+import { validImageAttachments } from '../../public/image-attachments.js'
+
+export interface ImageAttachment {
+  type: 'image'
+  mimeType: string
+  data: string
+}
+
 export type ClientRole = 'web' | 'host-supervisor' | 'interactive' | 'background'
 export type RunnerRole = 'interactive' | 'background'
 export type NoticeLevel = 'info' | 'error'
@@ -5,10 +13,22 @@ export type NoticeLevel = 'info' | 'error'
 export const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 export type ThinkingLevel = typeof THINKING_LEVELS[number]
 
+export interface ModelRoleConfiguration {
+  id: string
+  name: string
+  configured: boolean
+  provider: string | null
+  modelId: string | null
+  thinkingLevel: ThinkingLevel | 'auto' | 'inherit' | null
+  source: 'global' | 'project' | 'default'
+}
+
 export interface SessionConfiguration {
   provider: string | null
   modelId: string | null
   thinkingLevel: ThinkingLevel | null
+  roles?: ModelRoleConfiguration[]
+  roleStorage?: 'global' | 'project'
 }
 
 export interface ModelOption {
@@ -16,6 +36,8 @@ export interface ModelOption {
   id: string
   name: string
   thinkingLevels: ThinkingLevel[]
+  roles?: string[]
+  session?: boolean
 }
 
 export interface SessionRequest {
@@ -25,7 +47,10 @@ export interface SessionRequest {
   operation: 'get_models' | 'get_config' | 'configure'
   provider?: string
   modelId?: string
-  thinkingLevel?: ThinkingLevel
+  thinkingLevel?: ThinkingLevel | 'auto' | 'inherit'
+  role?: string
+  scope?: 'global' | 'project'
+  clear?: true
 }
 
 export interface SessionResponse {
@@ -87,6 +112,7 @@ export interface UserHistoryMessage {
   role: 'user'
   timestamp?: number
   text: string
+  images?: ImageAttachment[]
   remoteInputId?: string
 }
 
@@ -128,6 +154,7 @@ export interface ActiveToolSnapshot {
 export interface QueuedInput {
   inputId: string
   text: string
+  images?: ImageAttachment[]
   timestamp: number
 }
 
@@ -150,6 +177,7 @@ export interface SessionSnapshot {
   streamingThinkingText: string | null
   activeTools: ActiveToolSnapshot[]
   queuedInputs: QueuedInput[]
+  pendingQuestion: PendingQuestion | null
 }
 
 export interface OverviewSession {
@@ -167,6 +195,7 @@ export interface OverviewSession {
   costUsd: number | null
   runnerStatus: string | null
   queuedInputCount: number
+  pendingQuestion: boolean
 }
 
 export interface OverviewHost {
@@ -244,6 +273,7 @@ export interface SessionNameEvent {
 export interface RemoteInputFailedEvent {
   type: 'remote_input_failed'
   inputId?: string | null
+  message?: string
 }
 
 export interface QueuedInputAddEvent {
@@ -254,6 +284,42 @@ export interface QueuedInputAddEvent {
 export interface QueuedInputRemoveEvent {
   type: 'queued_input_remove'
   inputId: string | null
+}
+
+/** One clarifying question posed by the agent's `ask` tool. */
+export interface PendingQuestionItem {
+  id: string
+  question: string
+  header?: string
+  options: Array<{ label: string; description?: string }>
+  multi?: boolean
+  recommended?: number
+}
+
+/** A set of questions the session is blocked on; null when answered/cancelled. */
+export interface PendingQuestion {
+  questionId: string
+  questions: PendingQuestionItem[]
+  createdAt: number
+}
+
+export interface QuestionEvent {
+  type: 'question'
+  question: PendingQuestion | null
+}
+
+export interface QuestionAnswerItem {
+  id: string
+  selectedOptions: string[]
+  customInput?: string
+}
+
+/** Web → server → owning runner: answer the session's pending question. */
+export interface AnswerQuestionMessage {
+  type: 'answer_question'
+  sessionGuid: string
+  questionId: string
+  answers: QuestionAnswerItem[]
 }
 
 export type SessionEvent =
@@ -273,6 +339,7 @@ export type SessionEvent =
   | RemoteInputFailedEvent
   | QueuedInputAddEvent
   | QueuedInputRemoveEvent
+  | QuestionEvent
 
 export interface CatalogSessionMessage {
   sessionGuid: string
@@ -331,6 +398,7 @@ export interface HelloRunnerMessage {
   streamingThinkingText?: string | null
   history?: SanitizedMessage[]
   updatedAt?: number
+  pendingQuestion?: PendingQuestion | null
 }
 
 export type HelloMessage =
@@ -347,6 +415,8 @@ export interface InputMessage {
   type: 'input'
   sessionGuid?: string
   text?: string
+  images?: ImageAttachment[]
+  inputId?: string
 }
 
 export interface AbortMessage {
@@ -378,6 +448,39 @@ export interface CreateBackgroundSessionMessage {
 export interface RefreshHostSessionsMessage {
   type: 'refresh_host_sessions'
   hostId: string
+}
+
+/** Web → server → host: list subdirectories of `path` (null = host home). */
+export interface BrowseDirectoryMessage {
+  type: 'browse_directory'
+  requestId: string
+  hostId: string
+  path: string | null
+}
+
+/** Web → server → host: create `path` (absolute) and list it. */
+export interface CreateDirectoryMessage {
+  type: 'create_directory'
+  requestId: string
+  hostId: string
+  path: string
+}
+
+export interface DirectoryEntry {
+  name: string
+  path: string
+}
+
+/** Host → server → requesting web client. */
+export interface DirectoryListingMessage {
+  type: 'directory_listing'
+  requestId: string
+  hostId: string
+  path?: string
+  parent?: string | null
+  roots?: string[]
+  entries?: DirectoryEntry[]
+  error?: string
 }
 
 export interface HostSessionsMessage {
@@ -444,10 +547,14 @@ export type ClientMessage =
   | AttachMessage
   | InputMessage
   | AbortMessage
+  | AnswerQuestionMessage
   | TerminateSessionMessage
   | StartBackgroundSessionMessage
   | CreateBackgroundSessionMessage
   | RefreshHostSessionsMessage
+  | BrowseDirectoryMessage
+  | CreateDirectoryMessage
+  | DirectoryListingMessage
   | HostSessionsMessage
   | SessionSnapshotDataEnvelope
   | SessionSnapshotErrorMessage
@@ -516,6 +623,7 @@ export interface InputCommandMessage {
   type: 'input'
   text: string
   inputId: string
+  images?: ImageAttachment[]
 }
 
 export interface AbortCommandMessage {
@@ -550,6 +658,13 @@ export interface StartBackgroundSessionCommandMessage {
   createNew: boolean
 }
 
+/** Server → host: kill the background runner for a session if it does not exit on its own. */
+export interface StopBackgroundSessionCommandMessage {
+  type: 'stop_background_session'
+  sessionGuid: string
+  requestId: string | null
+}
+
 export interface SessionEventMessage {
   type: 'session_event'
   sessionGuid: string
@@ -576,7 +691,12 @@ export type ServerMessage =
   | ListSessionsMessage
   | ReadSessionSnapshotMessage
   | StartBackgroundSessionCommandMessage
+  | StopBackgroundSessionCommandMessage
+  | BrowseDirectoryMessage
+  | CreateDirectoryMessage
+  | DirectoryListingMessage
   | SessionEventMessage
+  | AnswerQuestionMessage
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
@@ -598,11 +718,48 @@ function isOptionalBoolean(value: unknown): boolean {
   return value === undefined || typeof value === 'boolean'
 }
 
+
+function isPendingQuestion(value: unknown): value is PendingQuestion {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.questionId) &&
+    typeof value.createdAt === 'number' &&
+    Array.isArray(value.questions) &&
+    value.questions.length > 0 &&
+    value.questions.every(
+      (q) =>
+        isRecord(q) &&
+        isNonEmptyString(q.id) &&
+        typeof q.question === 'string' &&
+        isOptionalString(q.header) &&
+        isOptionalBoolean(q.multi) &&
+        isOptionalNumber(q.recommended) &&
+        Array.isArray(q.options) &&
+        q.options.every((o) => isRecord(o) && isNonEmptyString(o.label) && isOptionalString(o.description)),
+    )
+  )
+}
+
+function isQuestionAnswers(value: unknown): value is QuestionAnswerItem[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (a) =>
+        isRecord(a) &&
+        isNonEmptyString(a.id) &&
+        Array.isArray(a.selectedOptions) &&
+        a.selectedOptions.every((s) => typeof s === 'string') &&
+        isOptionalString(a.customInput),
+    )
+  )
+}
 function isQueuedInput(value: unknown): value is QueuedInput {
   return (
     isRecord(value) &&
     isNonEmptyString(value.inputId) &&
     typeof value.text === 'string' &&
+    validImageAttachments(value.images) &&
     typeof value.timestamp === 'number' &&
     Number.isFinite(value.timestamp)
   )
@@ -613,7 +770,7 @@ function isSanitizedMessage(value: unknown): value is SanitizedMessage {
 
   switch (value.role) {
     case 'user':
-      return typeof value.text === 'string' && isOptionalString(value.remoteInputId)
+      return typeof value.text === 'string' && isOptionalString(value.remoteInputId) && validImageAttachments(value.images)
     case 'assistant':
       return (
         typeof value.text === 'string' &&
@@ -641,13 +798,23 @@ function isConfiguration(value: unknown): value is SessionConfiguration {
   return isRecord(value) &&
     (value.provider === null || isNonEmptyString(value.provider)) &&
     (value.modelId === null || isNonEmptyString(value.modelId)) &&
-    (value.thinkingLevel === null || isThinkingLevel(value.thinkingLevel))
+    (value.thinkingLevel === null || isThinkingLevel(value.thinkingLevel)) &&
+    (value.roleStorage === undefined || value.roleStorage === 'global' || value.roleStorage === 'project') &&
+    (value.roles === undefined || (Array.isArray(value.roles) && value.roles.every(role =>
+      isRecord(role) && isNonEmptyString(role.id) && role.id.length <= 128 && typeof role.name === 'string' &&
+      typeof role.configured === 'boolean' && (role.provider === null || isNonEmptyString(role.provider)) &&
+      (role.modelId === null || isNonEmptyString(role.modelId)) &&
+      (role.thinkingLevel === null || role.thinkingLevel === 'auto' || role.thinkingLevel === 'inherit' || isThinkingLevel(role.thinkingLevel)) &&
+      ['global', 'project', 'default'].includes(String(role.source)))))
 }
 
 function isModelOption(value: unknown): value is ModelOption {
   return isRecord(value) && isNonEmptyString(value.provider) && isNonEmptyString(value.id) &&
     typeof value.name === 'string' && Array.isArray(value.thinkingLevels) &&
-    value.thinkingLevels.length > 0 && value.thinkingLevels.every(isThinkingLevel)
+    value.thinkingLevels.length > 0 && value.thinkingLevels.every(isThinkingLevel) &&
+    (value.session === undefined || typeof value.session === 'boolean') &&
+    (value.roles === undefined || (Array.isArray(value.roles) &&
+      value.roles.every(role => isNonEmptyString(role) && role.length <= 128)))
 }
 
 function isSessionEvent(value: unknown): value is SessionEvent {
@@ -688,11 +855,13 @@ function isSessionEvent(value: unknown): value is SessionEvent {
     case 'session_name':
       return isOptionalString(value.sessionName)
     case 'remote_input_failed':
-      return isOptionalString(value.inputId)
+      return isOptionalString(value.inputId) && isOptionalString(value.message)
     case 'queued_input_add':
       return isQueuedInput(value.queuedInput)
     case 'queued_input_remove':
       return isOptionalString(value.inputId)
+    case 'question':
+      return value.question === null || isPendingQuestion(value.question)
     default:
       return false
   }
@@ -748,7 +917,7 @@ function isHistoryPage(value: unknown): value is HistoryPage {
     value.sanitized === true && typeof value.complete === 'boolean' && typeof value.truncated === 'boolean' &&
     typeof value.hasMore === 'boolean' && isOptionalString(value.leafId) && isOptionalString(value.nextCursor) &&
     Array.isArray(value.messages) && value.messages.length <= 1000 && value.messages.every(isSanitizedMessage) &&
-    new TextEncoder().encode(JSON.stringify(value)).length <= 1024 * 1024 + 4096
+    new TextEncoder().encode(JSON.stringify(value)).length <= 4 * 1024 * 1024 + 4096
 }
 
 export function parseClientMessage(raw: unknown): ClientMessage {
@@ -788,11 +957,16 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       const validBase = isNonEmptyString(raw.requestId) && raw.requestId.length <= 128 &&
         isNonEmptyString(raw.sessionGuid) && ['get_models', 'get_config', 'configure'].includes(String(raw.operation))
       const hasModel = raw.provider !== undefined || raw.modelId !== undefined
+      const hasRole = raw.role !== undefined
       const validSelection = (!hasModel || (isNonEmptyString(raw.provider) && isNonEmptyString(raw.modelId))) &&
-        (raw.thinkingLevel === undefined || isThinkingLevel(raw.thinkingLevel))
+        (raw.thinkingLevel === undefined || isThinkingLevel(raw.thinkingLevel) ||
+          (hasRole && (raw.thinkingLevel === 'auto' || raw.thinkingLevel === 'inherit'))) &&
+        (!hasRole || (isNonEmptyString(raw.role) && raw.role.length <= 128)) &&
+        (raw.scope === undefined || (hasRole && ['global', 'project'].includes(String(raw.scope)))) &&
+        (raw.clear === undefined || (hasRole && raw.clear === true && !hasModel && raw.thinkingLevel === undefined))
       const validOperation = raw.operation === 'configure'
-        ? hasModel || raw.thinkingLevel !== undefined
-        : !hasModel && raw.thinkingLevel === undefined
+        ? hasRole ? hasModel || raw.clear === true : hasModel || raw.thinkingLevel !== undefined
+        : !hasRole && !hasModel && raw.thinkingLevel === undefined && raw.scope === undefined && raw.clear === undefined
       return validBase && validSelection && validOperation
         ? parsedMessage(raw)
         : invalidClientMessage(raw, messageType, 'Invalid session request or model/thinking selection')
@@ -839,6 +1013,7 @@ export function parseClientMessage(raw: unknown): ClientMessage {
         !isOptionalBoolean(raw.busy) ||
         !isOptionalString(raw.streamingText) ||
         !isOptionalString(raw.streamingThinkingText) ||
+        (raw.pendingQuestion !== undefined && raw.pendingQuestion !== null && !isPendingQuestion(raw.pendingQuestion)) ||
         (raw.history !== undefined &&
           (!Array.isArray(raw.history) || !raw.history.every(isSanitizedMessage)))
       ) {
@@ -851,9 +1026,16 @@ export function parseClientMessage(raw: unknown): ClientMessage {
         ? parsedMessage(raw)
         : invalidClientMessage(raw, messageType, 'attach.sessionGuid must be a string or null')
     case 'input':
-      return isNonEmptyString(raw.sessionGuid) && typeof raw.text === 'string'
+      return isNonEmptyString(raw.sessionGuid) && typeof raw.text === 'string' &&
+        validImageAttachments(raw.images) && isOptionalString(raw.inputId) &&
+        (raw.inputId == null || (typeof raw.inputId === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(raw.inputId))) &&
+        (raw.text.trim().length > 0 || (Array.isArray(raw.images) && raw.images.length > 0))
         ? parsedMessage(raw)
-        : invalidClientMessage(raw, messageType, 'input requires string sessionGuid and text fields')
+        : invalidClientMessage(raw, messageType, 'Input needs text or up to 4 JPEG, PNG, WebP or GIF images (512 KiB each)')
+    case 'answer_question':
+      return isNonEmptyString(raw.sessionGuid) && isNonEmptyString(raw.questionId) && isQuestionAnswers(raw.answers)
+        ? parsedMessage(raw)
+        : invalidClientMessage(raw, messageType, 'answer_question requires sessionGuid, questionId and answers')
     case 'abort':
     case 'terminate_session':
       return isNonEmptyString(raw.sessionGuid)
@@ -875,6 +1057,22 @@ export function parseClientMessage(raw: unknown): ClientMessage {
       return isNonEmptyString(raw.hostId)
         ? parsedMessage(raw)
         : invalidClientMessage(raw, messageType, 'refresh_host_sessions.hostId must be a non-empty string')
+    case 'browse_directory':
+      return isNonEmptyString(raw.requestId) && isNonEmptyString(raw.hostId) && (raw.path === null || isNonEmptyString(raw.path))
+        ? parsedMessage(raw)
+        : invalidClientMessage(raw, messageType, 'browse_directory requires requestId, hostId and path (string or null)')
+    case 'create_directory':
+      return isNonEmptyString(raw.requestId) && isNonEmptyString(raw.hostId) && isNonEmptyString(raw.path)
+        ? parsedMessage(raw)
+        : invalidClientMessage(raw, messageType, 'create_directory requires requestId, hostId and path')
+    case 'directory_listing':
+      return isNonEmptyString(raw.requestId) && isNonEmptyString(raw.hostId) &&
+        isOptionalString(raw.path) && (raw.parent === undefined || raw.parent === null || isNonEmptyString(raw.parent)) &&
+        (raw.roots === undefined || (Array.isArray(raw.roots) && raw.roots.every(isNonEmptyString))) &&
+        (raw.entries === undefined || (Array.isArray(raw.entries) && raw.entries.every(e => isRecord(e) && isNonEmptyString(e.name) && isNonEmptyString(e.path)))) &&
+        isOptionalString(raw.error)
+        ? parsedMessage(raw)
+        : invalidClientMessage(raw, messageType, 'directory_listing contains invalid fields')
     case 'host_sessions':
       return isNonEmptyString(raw.hostId) &&
         (raw.sessions === undefined ||

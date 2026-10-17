@@ -1,5 +1,5 @@
-// Runtime-independent model control. Pi API access is injected so tests never
-// start a real agent, read credentials, or make provider calls.
+// Runtime-independent model control. Native API access is injected so tests
+// never start a real agent, read credentials, or make provider calls.
 const LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 class ControlError extends Error {
@@ -10,8 +10,18 @@ function failure(code, message) {
   return new ControlError(code, message);
 }
 
-export function createModelController({ pi, getContext, loadThinkingLevels, hasPendingInput = () => false }) {
+export function createModelController({ pi, getContext, loadThinkingLevels, loadRoleControls, hasPendingInput = () => false }) {
   let configuring = false;
+  const runtimes = new WeakMap();
+  function bindContext(ctx) {
+    if (!ctx || runtimes.has(ctx)) return;
+    const state = { controls: null, models: [], ready: null };
+    // Called from a session event so OMP resolves session-scoped settings,
+    // never another SDK session's process-global settings.
+    state.ready = Promise.resolve().then(() => loadRoleControls?.(ctx))
+      .then(controls => { state.controls = controls; }, () => {});
+    runtimes.set(ctx, state);
+  }
 
   function configuration() {
     const ctx = getContext();
@@ -20,6 +30,10 @@ export function createModelController({ pi, getContext, loadThinkingLevels, hasP
       provider: ctx?.model?.provider || null,
       modelId: ctx?.model?.id || null,
       thinkingLevel: LEVELS.has(level) ? level : null,
+      ...(runtimes.get(ctx)?.controls ? {
+        roles: runtimes.get(ctx).controls.list(runtimes.get(ctx).models),
+        roleStorage: runtimes.get(ctx).controls.storage(),
+      } : {}),
     };
   }
 
@@ -43,7 +57,18 @@ export function createModelController({ pi, getContext, loadThinkingLevels, hasP
       const ctx = getContext();
       checkContext(ctx, request.sessionGuid);
       if (configuring) throw failure("busy", "Session is being configured");
+      bindContext(ctx);
+      const runtime = runtimes.get(ctx);
+      await runtime.ready;
+      checkContext(ctx, request.sessionGuid);
+      if (configuring) throw failure("busy", "Session is being configured");
+      const isRole = request.role !== undefined;
+      if (isRole && !runtime.controls) throw failure("unsupported", "This runtime does not expose OMP role settings");
       if (request.operation === "get_config") {
+        if (runtime.controls && typeof ctx.modelRegistry?.getAvailable === "function") {
+          runtime.models = runtime.controls.models(await ctx.modelRegistry.getAvailable());
+          checkContext(ctx, request.sessionGuid);
+        }
         return { ...reply, success: true, data: { configuration: configuration() } };
       }
       if (!["get_models", "configure"].includes(request.operation)) {
@@ -52,7 +77,7 @@ export function createModelController({ pi, getContext, loadThinkingLevels, hasP
       if (request.operation === "configure") {
         checkIdle(ctx);
         configuring = ownsLock = true;
-        if (typeof pi.setModel !== "function" || typeof pi.setThinkingLevel !== "function") {
+        if (!isRole && (typeof pi.setModel !== "function" || typeof pi.setThinkingLevel !== "function")) {
           throw failure("unsupported", "This runtime cannot configure model/thinking through the extension API");
         }
       }
@@ -63,30 +88,63 @@ export function createModelController({ pi, getContext, loadThinkingLevels, hasP
       try {
         levelsFor = await loadThinkingLevels();
       } catch {
-        throw failure("unsupported", "Runtime thinking-level enumeration is unavailable; a compatible Pi API is required");
+        throw failure("unsupported", "Runtime thinking-level enumeration is unavailable; update the OMP/Pi runtime");
       }
       if (typeof levelsFor !== "function") throw failure("unsupported", "Runtime does not expose supported thinking levels");
-      const available = await ctx.modelRegistry.getAvailable();
+      const sessionModels = await ctx.modelRegistry.getAvailable();
+      const available = runtime.controls ? runtime.controls.models(sessionModels) : sessionModels;
+      const sessionKeys = new Set(sessionModels.map(model => `${model.provider}/${model.id}`));
       checkContext(ctx, request.sessionGuid);
+      runtime.models = available;
       const models = available.map(model => {
         const levels = levelsFor(model);
         if (!Array.isArray(levels) || !levels.length || !levels.every(level => LEVELS.has(level))) {
           throw failure("unsupported", "Runtime returned unsupported thinking-level metadata");
         }
         // Explicit projection: model objects can contain authentication headers.
-        return { provider: model.provider, id: model.id, name: model.name || model.id, thinkingLevels: levels };
+        return { provider: model.provider, id: model.id, name: model.name || model.id, thinkingLevels: levels,
+          ...(runtime.controls ? { roles: runtime.controls.allowedRoles(model), session: sessionKeys.has(`${model.provider}/${model.id}`) } : {}) };
       });
       if (request.operation === "get_models") {
         return { ...reply, success: true, data: { configuration: configuration(), models } };
       }
       checkIdle(ctx);
+      if (isRole) {
+        if (!runtime.controls.list(available).some(role => role.id === request.role)) {
+          throw failure("unsupported_role", "Role is not supported by this runtime");
+        }
+        const scope = request.scope ?? runtime.controls.storage();
+        if (!["global", "project"].includes(scope) || (request.clear !== undefined && request.clear !== true) ||
+            (request.clear && (request.provider !== undefined || request.modelId !== undefined || request.thinkingLevel !== undefined))) {
+          throw failure("invalid_selection", "Specify a role model or clear the role in global/project settings");
+        }
+        if (!request.clear) {
+          const target = available.find(model => model.provider === request.provider && model.id === request.modelId);
+          if (!target || !runtime.controls.allowedRoles(target).includes(request.role)) {
+            throw failure("unavailable_model", "Model is not available for this role in this runtime");
+          }
+          if (request.thinkingLevel !== undefined && !["auto", "inherit"].includes(request.thinkingLevel) &&
+              !levelsFor(target).includes(request.thinkingLevel)) {
+            throw failure("unsupported_level", "Thinking level is not supported by the selected role model");
+          }
+        }
+        mutationStarted = true;
+        if (!await runtime.controls.set({ ...request, scope })) {
+          throw failure("configuration_changed", "Runtime did not persist the requested role configuration");
+        }
+        checkContext(ctx, request.sessionGuid);
+        return { ...reply, success: true, data: { configuration: configuration() } };
+      }
+      if (request.scope !== undefined || request.clear !== undefined) {
+        throw failure("invalid_selection", "Scope and clear require a role");
+      }
       const hasModel = request.provider !== undefined || request.modelId !== undefined;
       if ((!hasModel && request.thinkingLevel === undefined) ||
           (hasModel && (!request.provider || !request.modelId))) {
         throw failure("invalid_selection", "Specify provider/model together, a thinking level, or both");
       }
       const target = hasModel
-        ? available.find(model => model.provider === request.provider && model.id === request.modelId)
+        ? sessionModels.find(model => model.provider === request.provider && model.id === request.modelId)
         : ctx.model;
       if (!target) throw failure("unavailable_model", "Model is not available in this session's runtime");
       if (request.thinkingLevel !== undefined && !levelsFor(target).includes(request.thinkingLevel)) {
@@ -122,5 +180,5 @@ export function createModelController({ pi, getContext, loadThinkingLevels, hasP
     }
   }
 
-  return { run, configuration, isConfiguring: () => configuring };
+  return { run, configuration, bindContext, isConfiguring: () => configuring };
 }

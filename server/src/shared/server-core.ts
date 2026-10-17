@@ -16,6 +16,7 @@ import {
   type SessionRequest,
   type SessionResponse,
 } from './protocol.js'
+import type { SessionConfiguration } from './protocol.js'
 import type {
   ActiveTool,
   CatalogSession,
@@ -42,6 +43,17 @@ interface EnsureBackgroundOptions {
 
 const DEFAULT_MAX_SESSION_HISTORY_BYTES = 4 * 1024 * 1024
 
+function publicConfiguration(value: SessionConfiguration): SessionConfiguration {
+  return {
+    provider: value.provider, modelId: value.modelId, thinkingLevel: value.thinkingLevel,
+    ...(value.roleStorage ? { roleStorage: value.roleStorage } : {}),
+    ...(value.roles ? { roles: value.roles.map(role => ({
+      id: role.id, name: role.name, configured: role.configured,
+      provider: role.provider, modelId: role.modelId, thinkingLevel: role.thinkingLevel, source: role.source,
+    })) } : {}),
+  }
+}
+
 export function createServerCore(
   transport: Transport,
   timers: Timers,
@@ -58,6 +70,9 @@ export function createServerCore(
   const pendingRequests = new Map<string, {
     requester: string; runner: string; request: SessionRequest; timeout: unknown
   }>()
+  // Directory browse/create requests in flight: requestId → requesting web connection.
+  const pendingDirectoryRequests = new Map<string, { requester: string; hostId: string; timeout: unknown }>()
+  const DIRECTORY_REQUEST_TIMEOUT_MS = 15_000
   const maxSessionHistoryBytes =
     typeof config.maxSessionHistoryBytes === 'number' &&
     Number.isFinite(config.maxSessionHistoryBytes) &&
@@ -211,6 +226,10 @@ export function createServerCore(
   }
 
   function handleSessionRequest(connId: string, request: SessionRequest): void {
+    if (request.role !== undefined && authContexts.get(connId)?.kind !== 'admin') {
+      requestError(connId, request, 'forbidden', 'Persistent role settings require an administrator browser connection')
+      return
+    }
     const ownRequests = Array.from(pendingRequests.values()).filter(p => p.requester === connId)
     if (ownRequests.some(p => p.request.requestId === request.requestId)) {
       requestError(connId, request, 'duplicate_request', 'Request ID is already pending')
@@ -234,6 +253,10 @@ export function createServerCore(
       requestError(connId, request, 'unsupported', 'Runner does not support model control; update its extension when convenient')
       return
     }
+    if (request.role !== undefined && !runnerCapabilities.get(runner)?.has('model_roles_v1')) {
+      requestError(connId, request, 'unsupported', 'Runner requires an extension reload before role settings can be changed')
+      return
+    }
     if (isConfiguring(session.sessionGuid) || (request.operation === 'configure' &&
         (session.busy || session.queuedInputs.length > 0 || session.pendingInputs.length > 0 || control.isDispatching(session.sessionGuid)))) {
       requestError(connId, request, 'busy', 'Session is busy, queued, or being configured; wait or abort first')
@@ -248,6 +271,9 @@ export function createServerCore(
       type: 'session_request', requestId: id, sessionGuid: request.sessionGuid, operation: request.operation,
       ...(request.provider !== undefined ? { provider: request.provider, modelId: request.modelId } : {}),
       ...(request.thinkingLevel !== undefined ? { thinkingLevel: request.thinkingLevel } : {}),
+      ...(request.role !== undefined ? { role: request.role } : {}),
+      ...(request.scope !== undefined ? { scope: request.scope } : {}),
+      ...(request.clear !== undefined ? { clear: request.clear } : {}),
     })) {
       failRequest(id, 'disconnected', 'Could not contact runner; inspect state before retrying')
     }
@@ -269,10 +295,7 @@ export function createServerCore(
     pendingRequests.delete(response.requestId)
     // Project onto the public schema; never forward arbitrary model/auth fields.
     const data = response.success ? response.data : undefined
-    const configuration = data ? {
-      provider: data.configuration.provider, modelId: data.configuration.modelId,
-      thinkingLevel: data.configuration.thinkingLevel,
-    } : undefined
+    const configuration = data ? publicConfiguration(data.configuration) : undefined
     if (response.success && configuration) {
       session.configuration = configuration
       session.model = configuration.modelId
@@ -284,7 +307,8 @@ export function createServerCore(
       sessionGuid: response.sessionGuid, success: response.success,
       ...(response.success && data && configuration ? { data: { configuration,
         ...(data.models ? { models: data.models.map(m => ({ provider: m.provider, id: m.id,
-          name: m.name, thinkingLevels: m.thinkingLevels })) } : {}),
+          name: m.name, thinkingLevels: m.thinkingLevels,
+          ...(m.roles ? { roles: m.roles } : {}), ...(m.session !== undefined ? { session: m.session } : {}) })) } : {}),
       } } : { error: { code: response.error!.code, message: response.error!.message } }),
     })
   }
@@ -396,6 +420,7 @@ export function createServerCore(
       const session = sessionGuid ? getKnownSession(sessionGuid) : null
       const hostId = message.type === 'control_request' && message.operation === 'new' ? message.hostId : session?.hostId
       let scope: OrchestratorScope | null = null
+      if (message.type === 'answer_question') scope = 'input'
       if (message.type === 'attach') scope = 'read'
       if (message.type === 'session_request') scope = message.operation === 'configure' ? 'configure' : 'read'
       if (message.type === 'control_request') scope = ({ send: 'input', abort: 'abort', terminate: 'abort', resume: 'start', new: 'start', history: 'read', get_input: 'read' } as const)[message.operation]
@@ -433,7 +458,8 @@ export function createServerCore(
 
     if (message.type === 'input') {
       const text = String(message.text || '').trim()
-      if (!message.sessionGuid || !text) return
+      const images = message.images
+      if (!message.sessionGuid || (!text && !images?.length)) return
 
       const session = getKnownSession(message.sessionGuid)
       if (!session) {
@@ -448,24 +474,32 @@ export function createServerCore(
         send(connId, { type: 'error', message: 'Session is being configured; retry input after configuration completes' })
         return
       }
-      const inputId = createId()
+      const inputId = message.inputId || createId()
       const target = getOwnerConnection(session)
+      if (images?.length && target && !runnerCapabilities.get(target)?.has('image_input_v1')) {
+        send(connId, { type: 'error', message: 'This runner has an older extension without image support. Reload it when convenient or start a new session; your draft is retained.' })
+        return
+      }
       const shouldQueueVisibly = !target || session.busy
 
       if (shouldQueueVisibly) {
         addQueuedInput(session, {
           inputId,
           text,
+          ...(images?.length ? { images } : {}),
           timestamp: Date.now(),
         })
       }
 
       if (target) {
-        send(target, { type: 'input', text, inputId })
+        if (!send(target, { type: 'input', text, inputId, ...(images?.length ? { images } : {}) })) {
+          if (shouldQueueVisibly) removeQueuedInput(session, inputId)
+          send(connId, { type: 'error', message: 'Runner disconnected before delivery; your draft has been retained' })
+        }
         return
       }
 
-      session.pendingInputs.push({ inputId, text })
+      session.pendingInputs.push({ inputId, text, ...(images?.length ? { images } : {}) })
       const started = ensureBackgroundSession(session)
       if (!started) {
         session.pendingInputs.pop()
@@ -498,6 +532,21 @@ export function createServerCore(
       send(target, { type: 'abort' })
       return
     }
+    if (message.type === 'answer_question') {
+      const session = getKnownSession(message.sessionGuid)
+      const target = getOwnerConnection(session)
+      if (!session || !target) {
+        send(connId, { type: 'error', message: 'Session is not currently owned by an active runner' })
+        return
+      }
+      if (session.pendingQuestion?.questionId !== message.questionId) {
+        send(connId, { type: 'error', message: 'That question is no longer pending' })
+        return
+      }
+      send(target, message)
+      return
+    }
+
 
     if (message.type === 'terminate_session') {
       const session = getKnownSession(message.sessionGuid)
@@ -510,6 +559,14 @@ export function createServerCore(
         return
       }
       send(target, { type: 'terminate_session' })
+      // A background runner that ignores terminate_session (or hangs in shutdown)
+      // would otherwise live until its supervisor exits; the supervisor enforces it.
+      if (session.owner === 'background' && target === session.backgroundConn) {
+        const host = session.hostId ? hosts.get(session.hostId) : null
+        if (host?.conn && transport.isOpen(host.conn)) {
+          send(host.conn, { type: 'stop_background_session', sessionGuid: session.sessionGuid, requestId: session.launchRequestId })
+        }
+      }
       send(connId, {
         type: 'notice',
         level: 'info',
@@ -566,6 +623,25 @@ export function createServerCore(
       return
     }
 
+    if (message.type === 'browse_directory' || message.type === 'create_directory') {
+      const host = hosts.get(message.hostId)
+      if (!host?.conn || !transport.isOpen(host.conn)) {
+        send(connId, { type: 'directory_listing', requestId: message.requestId, hostId: message.hostId, error: `Host ${message.hostId} is not connected` })
+        return
+      }
+      if (pendingDirectoryRequests.has(message.requestId)) {
+        send(connId, { type: 'directory_listing', requestId: message.requestId, hostId: message.hostId, error: 'Duplicate request id' })
+        return
+      }
+      const timeout = timers.setTimeout(() => {
+        pendingDirectoryRequests.delete(message.requestId)
+        send(connId, { type: 'directory_listing', requestId: message.requestId, hostId: message.hostId, error: 'Host did not respond' })
+      }, DIRECTORY_REQUEST_TIMEOUT_MS)
+      pendingDirectoryRequests.set(message.requestId, { requester: connId, hostId: message.hostId, timeout })
+      send(host.conn, message)
+      return
+    }
+
     if (message.type === 'refresh_host_sessions') {
       const host = hosts.get(message.hostId)
       if (!host?.conn || !transport.isOpen(host.conn)) {
@@ -613,6 +689,15 @@ export function createServerCore(
         level: 'error',
         message: message.message || 'Failed to load session history',
       })
+      return
+    }
+
+    if (message.type === 'directory_listing') {
+      const pending = pendingDirectoryRequests.get(message.requestId)
+      if (!pending || pending.hostId !== client.hostId) return
+      pendingDirectoryRequests.delete(message.requestId)
+      timers.clearTimeout(pending.timeout)
+      send(pending.requester, message)
       return
     }
 
@@ -671,6 +756,7 @@ export function createServerCore(
         session.streamingText = null
         session.streamingThinkingText = null
         session.activeTools.clear()
+        session.pendingQuestion = null
         session.runnerStatus = 'released'
         promoteSessionOwner(session)
         deliverPendingInputs(session)
@@ -692,6 +778,9 @@ export function createServerCore(
     if (message.event?.type === 'input_status') {
       if (message.event.input.sessionGuid === session.sessionGuid) control.event(connId, message.event.input)
       return
+    }
+    if (message.event?.type === 'configuration') {
+      message.event = { type: 'configuration', configuration: publicConfiguration(message.event.configuration) }
     }
     applySessionEvent(session, message.event)
     sendToAttached(session.sessionGuid, {
@@ -724,7 +813,7 @@ export function createServerCore(
     if (!message.sessionGuid) return
     const session = getOrCreateSession(message.sessionGuid)
     runnerCapabilities.set(connId, new Set(message.capabilities || []))
-    session.configuration = message.configuration
+    session.configuration = message.configuration ? publicConfiguration(message.configuration) : undefined
     if (message.role === 'interactive') {
       replaceConnection(session, 'interactiveConn', connId)
       session.pendingInteractiveConn = connId
@@ -755,6 +844,7 @@ export function createServerCore(
         ? message.costUsd
         : session.costUsd
     session.busy = !!message.busy
+    session.pendingQuestion = message.pendingQuestion || null
     if (Array.isArray(message.history)) {
       const limited = limitHistoryByBytes(message.history, maxSessionHistoryBytes)
       session.history = limited.history
@@ -792,6 +882,7 @@ export function createServerCore(
     }
 
     control.hello(connId, hostId, message)
+    if (message.role === 'background') session.launchRequestId = message.launchRequestId || null
     if (message.launchRequestId) {
       broadcastWeb({
         type: 'background_session_started',
@@ -835,7 +926,7 @@ export function createServerCore(
 
     switch (event.type) {
       case 'configuration':
-        session.configuration = event.configuration
+        session.configuration = publicConfiguration(event.configuration)
         session.model = event.configuration.modelId
         break
       case 'message':
@@ -901,6 +992,10 @@ export function createServerCore(
           session.streamingThinkingText = null
           session.activeTools.clear()
         }
+        break
+
+      case 'question':
+        session.pendingQuestion = event.question
         break
 
       case 'model':
@@ -1026,6 +1121,7 @@ export function createServerCore(
       session.streamingText = null
       session.streamingThinkingText = null
       session.activeTools.clear()
+      session.pendingQuestion = null
       session.runnerStatus = 'exited'
     }
 
@@ -1100,6 +1196,8 @@ export function createServerCore(
       streamingThinkingText: null,
       activeTools: new Map<string, ActiveTool>(),
       runnerStatus: null,
+      launchRequestId: null,
+      pendingQuestion: null,
       pendingInputs: [],
       queuedInputs: [],
       updatedAt: Date.now(),
@@ -1125,6 +1223,7 @@ export function createServerCore(
       streamingThinkingText: null,
       activeTools: [],
       queuedInputs: [],
+      pendingQuestion: null,
     }
   }
 
@@ -1151,6 +1250,7 @@ export function createServerCore(
       streamingThinkingText: session.streamingThinkingText,
       activeTools: Array.from(session.activeTools.values()),
       queuedInputs: session.queuedInputs,
+      pendingQuestion: session.pendingQuestion,
     }
   }
 
@@ -1341,6 +1441,7 @@ export function createServerCore(
           costUsd: null,
           runnerStatus: null,
           queuedInputCount: 0,
+          pendingQuestion: false,
         })
       }
 
@@ -1366,6 +1467,7 @@ export function createServerCore(
           costUsd: session.costUsd,
           runnerStatus: session.runnerStatus || null,
           queuedInputCount: session.queuedInputs.length,
+          pendingQuestion: !!session.pendingQuestion,
         })
       }
 
@@ -1421,9 +1523,17 @@ export function createServerCore(
     const target = getOwnerConnection(session)
     if (!target || session.pendingInputs.length === 0) return
     while (session.pendingInputs.length > 0) {
-      const input = session.pendingInputs.shift()
-      if (!input?.text) continue
-      send(target, { type: 'input', text: input.text, inputId: input.inputId })
+      const input = session.pendingInputs[0]
+      if (input.images?.length && !runnerCapabilities.get(target)?.has('image_input_v1')) {
+        session.pendingInputs.shift()
+        removeQueuedInput(session, input.inputId)
+        sendToAttached(session.sessionGuid, { type: 'session_event', sessionGuid: session.sessionGuid,
+          event: { type: 'remote_input_failed', inputId: input.inputId,
+            message: 'Runner has no image support. Reload its extension or start a new session; your draft is retained.' } })
+        continue
+      }
+      if (!send(target, { type: 'input', ...input })) return
+      session.pendingInputs.shift()
     }
   }
 
@@ -1492,7 +1602,7 @@ export function createServerCore(
   }
 
   function addQueuedInput(session: SessionState, queuedInput: QueuedInput): void {
-    if (!queuedInput?.inputId || !queuedInput.text) return
+    if (!queuedInput?.inputId || (!queuedInput.text && !queuedInput.images?.length)) return
     session.queuedInputs.push(queuedInput)
     session.updatedAt = Date.now()
     sendToAttached(session.sessionGuid, {

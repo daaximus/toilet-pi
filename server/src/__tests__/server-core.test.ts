@@ -142,7 +142,7 @@ describe('createServerCore', () => {
     expect(transport.drain('web-1')).toEqual([
       {
         type: 'error',
-        message: 'Invalid message: input requires string sessionGuid and text fields',
+        message: 'Invalid message: Input needs text or up to 4 JPEG, PNG, WebP or GIF images (512 KiB each)',
       },
     ])
   })
@@ -312,8 +312,9 @@ describe('createServerCore', () => {
     })
   })
 
-  it('queues input for inactive sessions and delivers it when a background runner connects', async () => {
+  it.each([false, true])('queues input for inactive sessions and preserves images=%s on resume', async (withImages) => {
     const { core, transport } = createTestServer()
+    const images = withImages ? [{ type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' }] : undefined
     connect(transport, core, 'host-conn')
     connect(transport, core, 'web-1')
 
@@ -343,8 +344,21 @@ describe('createServerCore', () => {
     await send(core, 'web-1', {
       type: 'input',
       sessionGuid: 'session-1',
-      text: 'hello from web',
+      text: withImages ? '' : 'hello from web',
+      ...(images ? { images } : {}),
     })
+    expect(transport.messages.get('web-1')).toContainEqual(expect.objectContaining({
+      type: 'session_event',
+      event: expect.objectContaining({ type: 'queued_input_add',
+        queuedInput: expect.objectContaining({ text: withImages ? '' : 'hello from web', ...(images ? { images } : {}) }) }),
+    }))
+    await send(core, 'web-1', { type: 'attach', sessionGuid: 'session-1' })
+    expect(transport.messages.get('web-1')).toContainEqual(expect.objectContaining({
+      type: 'session_snapshot',
+      session: expect.objectContaining({ queuedInputs: [expect.objectContaining({
+        text: withImages ? '' : 'hello from web', ...(images ? { images } : {}),
+      })] }),
+    }))
 
     expect(transport.messages.get('host-conn')).toContainEqual({
       type: 'start_background_session',
@@ -360,6 +374,7 @@ describe('createServerCore', () => {
     await send(core, 'background-1', {
       type: 'hello',
       role: 'background',
+      capabilities: ['image_input_v1'],
       hostId: 'host-1',
       sessionGuid: 'session-1',
       history: [],
@@ -367,8 +382,64 @@ describe('createServerCore', () => {
     })
 
     expect(transport.messages.get('background-1')).toContainEqual(
-      expect.objectContaining({ type: 'input', text: 'hello from web' }),
+      expect.objectContaining({ type: 'input', text: withImages ? '' : 'hello from web', ...(images ? { images } : {}) }),
     )
+  })
+
+  it('keeps image-only input visible while a busy runner queues it', async () => {
+    const { core, transport } = createTestServer()
+    const images = [{ type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' }]
+    connect(transport, core, 'web-1')
+    connect(transport, core, 'interactive-1')
+    await send(core, 'web-1', { type: 'hello', role: 'web' })
+    await send(core, 'interactive-1', { type: 'hello', role: 'interactive', hostId: 'host-1',
+      sessionGuid: 'session-1', capabilities: ['image_input_v1'], busy: true, history: [] })
+    await send(core, 'web-1', { type: 'attach', sessionGuid: 'session-1' })
+    transport.drain('web-1')
+    transport.drain('interactive-1')
+    await send(core, 'web-1', { type: 'input', sessionGuid: 'session-1', inputId: 'queued-image', text: '', images })
+    expect(transport.messages.get('web-1')).toContainEqual(expect.objectContaining({
+      type: 'session_event', event: { type: 'queued_input_add',
+        queuedInput: { inputId: 'queued-image', text: '', images, timestamp: expect.any(Number) } },
+    }))
+    expect(transport.messages.get('interactive-1')).toContainEqual({ type: 'input', inputId: 'queued-image', text: '', images })
+    await send(core, 'web-1', { type: 'attach', sessionGuid: 'session-1' })
+    expect(transport.last('web-1')).toMatchObject({ type: 'session_snapshot',
+      session: { queuedInputs: [{ inputId: 'queued-image', text: '', images }] } })
+  })
+
+  it('preserves image history while excluding private runner metadata', async () => {
+    const { core, transport } = createTestServer()
+    const images = [{ type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' }]
+    connect(transport, core, 'web-1')
+    connect(transport, core, 'interactive-1')
+    await send(core, 'web-1', { type: 'hello', role: 'web' })
+    await send(core, 'interactive-1', { type: 'hello', role: 'interactive', hostId: 'host-1',
+      sessionGuid: 'session-1', capabilities: ['history_v1'], history: [] })
+    await send(core, 'web-1', { type: 'control_request', requestId: 'history-images', operation: 'history', sessionGuid: 'session-1' })
+    const command = transport.last('interactive-1')
+    if (command?.type !== 'control_command') throw new Error('History request was not routed')
+    await send(core, 'interactive-1', { type: 'control_response', requestId: command.requestId, success: true, data: {
+      history: { source: 'runtime-branch', sanitized: true, complete: true, truncated: false, hasMore: false,
+        messages: [{ role: 'user', text: '', images, providerMetadata: { credential: 'private' } }] },
+    } })
+    const response = transport.last('web-1')
+    expect(response).toMatchObject({ type: 'control_response', requestId: 'history-images', success: true,
+      data: { history: { messages: [{ role: 'user', text: '', images }] } } })
+    expect(JSON.stringify(response)).not.toContain('private')
+  })
+
+  it('rejects images on older active runners instead of silently delivering only text', async () => {
+    const { core, transport } = createTestServer()
+    connect(transport, core, 'web-1')
+    connect(transport, core, 'interactive-1')
+    await send(core, 'web-1', { type: 'hello', role: 'web' })
+    await send(core, 'interactive-1', { type: 'hello', role: 'interactive', hostId: 'host-1', sessionGuid: 'session-1', history: [] })
+    transport.drain('interactive-1')
+    await send(core, 'web-1', { type: 'input', sessionGuid: 'session-1', text: 'Describe this',
+      images: [{ type: 'image', mimeType: 'image/png', data: 'aGVsbG8=' }] })
+    expect(transport.drain('interactive-1')).toEqual([])
+    expect(transport.last('web-1')).toMatchObject({ type: 'error', message: expect.stringContaining('older extension') })
   })
 
   it('requests session snapshots from the host when a web client attaches', async () => {
@@ -455,7 +526,52 @@ describe('createServerCore', () => {
         streamingThinkingText: null,
         activeTools: [],
         queuedInputs: [],
+        pendingQuestion: null,
       },
     })
+  })
+
+  it('routes directory listings only to the requesting web client and times out unanswered requests', async () => {
+    const { core, transport, timers } = createTestServer()
+    connect(transport, core, 'host-conn')
+    connect(transport, core, 'web-1')
+    connect(transport, core, 'web-2')
+    await send(core, 'host-conn', { type: 'hello', role: 'host-supervisor', hostId: 'host-1', hostname: 'host-1' })
+    await send(core, 'web-1', { type: 'hello', role: 'web' })
+    await send(core, 'web-2', { type: 'hello', role: 'web' })
+    transport.drain('web-1'); transport.drain('web-2'); transport.drain('host-conn')
+
+    await send(core, 'web-1', { type: 'browse_directory', requestId: 'r1', hostId: 'host-1', path: null })
+    expect(transport.drain('host-conn')).toEqual([{ type: 'browse_directory', requestId: 'r1', hostId: 'host-1', path: null }])
+
+    const listing = { type: 'directory_listing', requestId: 'r1', hostId: 'host-1', path: '/home', parent: '/', roots: ['/'], entries: [{ name: 'a', path: '/home/a' }] }
+    await send(core, 'host-conn', listing)
+    expect(transport.drain('web-1')).toEqual([listing])
+    expect(transport.drain('web-2')).toEqual([])
+
+    await send(core, 'web-2', { type: 'create_directory', requestId: 'r2', hostId: 'host-1', path: '/home/new' })
+    timers.runAll()
+    expect(transport.drain('web-2')).toEqual([{ type: 'directory_listing', requestId: 'r2', hostId: 'host-1', error: 'Host did not respond' }])
+    // A late reply after the timeout is dropped rather than delivered twice.
+    await send(core, 'host-conn', { type: 'directory_listing', requestId: 'r2', hostId: 'host-1', path: '/home/new', entries: [] })
+    expect(transport.drain('web-2')).toEqual([])
+
+    await send(core, 'web-1', { type: 'browse_directory', requestId: 'r3', hostId: 'missing', path: null })
+    expect(transport.drain('web-1')).toEqual([{ type: 'directory_listing', requestId: 'r3', hostId: 'missing', error: 'Host missing is not connected' }])
+  })
+
+  it('asks the supervisor to stop a background runner when a session is killed', async () => {
+    const { core, transport } = createTestServer()
+    connect(transport, core, 'host-conn')
+    connect(transport, core, 'runner-conn')
+    connect(transport, core, 'web-1')
+    await send(core, 'host-conn', { type: 'hello', role: 'host-supervisor', hostId: 'host-1', hostname: 'host-1' })
+    await send(core, 'runner-conn', { type: 'hello', role: 'background', hostId: 'host-1', sessionGuid: 'session-1', launchRequestId: 'launch-1', cwd: '/w' })
+    await send(core, 'web-1', { type: 'hello', role: 'web' })
+    transport.drain('host-conn'); transport.drain('runner-conn')
+
+    await send(core, 'web-1', { type: 'terminate_session', sessionGuid: 'session-1' })
+    expect(transport.drain('runner-conn')).toEqual([{ type: 'terminate_session' }])
+    expect(transport.drain('host-conn')).toEqual([{ type: 'stop_background_session', sessionGuid: 'session-1', requestId: 'launch-1' }])
   })
 })

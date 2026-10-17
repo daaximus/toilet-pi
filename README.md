@@ -35,8 +35,22 @@ This design provides one UI across multiple computers without moving session fil
 - Seamless handoff back to the local pi TUI
 - Plain-text orchestration CLI with tracked dispatch, settlement waits, and branch-aware history
 - Scoped orchestrator tokens and browser model/thinking selection
+- OMP role models, including advisor, with global or project settings
+- Image attachments with previews and conversation history
+- Case-insensitive project/session search by name or project path
 
 Interactive sessions remain usable if Toilet-Pi is offline. Background sessions keep running and reconnect after temporary server outages; they stop when their host supervisor shuts down, the session is closed, or an interactive agent takes ownership.
+
+## Mobile controls
+
+- **Search:** use the sidebar search field in Sessions or Projects. A project-name/path match shows its sessions; a session-name or preview match shows the matching sessions. Clear restores the full list.
+- **Models & roles:** open a running session, expand the panel, and tap **Load models**. Choose **Current session** to change its model/thinking, or a native OMP role such as **Advisor**. Role changes save to the selected **Global settings** or **Project settings** scope; project overrides take precedence. **Reset** removes that scope's assignment. Role choices and compatible models come from the installed OMP runtime, including custom roles.
+- **Images:** tap **Attach**, choose up to four images, review the previews, and send with or without text. JPEG, PNG, WebP, and GIF are supported, up to 20 MiB per source file. Images above 512 KiB are resized to JPEG; large GIFs become still images. Export HEIC as JPEG first. Use a model that accepts images.
+
+Image drafts clear only after the runtime confirms receipt. Failed or uncertain delivery retains the draft; check the conversation before retrying. Older runners reject image delivery rather than silently dropping attachments.
+
+After an extension update, restart existing OMP runners when idle and resume their saved sessions. OMP 18.8.7's `/reload-plugins` refreshes commands and skills but does not reload extension code. New background sessions load the updated extension immediately. Model changes are disabled while a session has work or queued input.
+
 
 ## Requirements
 
@@ -63,7 +77,7 @@ omp plugin install github:mrexodia/toilet-pi
 
 Both agents load the same `toilet-pi.ts` extension; OMP does not require a separate entrypoint.
 
-To update later, run `pi update --extensions` for pi or `omp plugin upgrade toilet-pi` for OMP, then restart the agent or run `/reload`.
+To update later, run `pi update --extensions` for pi or `omp plugin upgrade toilet-pi` for OMP. Restart OMP to load the updated extension; pi also supports `/reload`.
 
 ### 2. Start the server
 
@@ -109,6 +123,7 @@ Open the web UI to:
 - send a prompt to an active session
 - resume an inactive session by sending it a prompt
 - start a new session from the **Projects** view
+- start a new session in any folder on a connected machine via **⋮ → New Session in folder…** (browse, or create the folder first)
 - abort an active run
 
 Normal local pi and OMP sessions connect automatically through `toilet-pi.ts`.
@@ -237,7 +252,7 @@ Machine configuration is normally stored in the active agent directory as `toile
 ## Troubleshooting
 
 - **Machine not visible:** make sure `npm run supervisor` is running on that machine.
-- **Interactive session not visible:** confirm the package is installed with `pi list` or `omp plugin list`, then restart the agent or run `/reload`.
+- **Interactive session not visible:** confirm the package is installed with `pi list` or `omp plugin list`, then restart the agent (or use `/reload` in pi).
 - **Inactive session will not start:** the machine's supervisor must be connected.
 - **Wrong server configured:** run `/toilet-pi` again with a newly generated machine URL.
 - **Remote access fails:** use HTTPS/WSS when exposing Toilet-Pi outside your local network.
