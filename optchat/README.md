@@ -71,6 +71,10 @@ toilet-pi send optchat 'look into the flaky build' --wait
 toilet-pi history optchat --last 6
 ```
 
+Follow-up messages sent while Optchat is busy join the active turn as steering, rather than waiting for the
+turn to finish. They reach the model after the current tool round (not in the middle of a model response).
+When idle, a follow-up starts a normal turn.
+
 For the agent's own tools that drive other sessions (`agents`, `agent_send`, `agent_history`, `agent_abort`,
 `agent_resume`, `agent_new`), give it the CLI's saved login (`toilet-pi login`) or a scoped token in
 `TOILET_PI_ORCHESTRATOR_TOKEN` with `TOILET_PI_CLI_SERVER`. A task sent with `agent_send` returns at once; a durable

@@ -28,6 +28,9 @@ export function groupCollapsedHistory(history) {
 	for (const message of Array.isArray(history) ? history : []) {
 		if (isAssistantTurnMessage(message)) {
 			turnMessages.push(message);
+			// A completed answer ends its group even if manual shell output or another run follows.
+			// Otherwise a trailing toolResult can cause the answer itself to be collapsed.
+			if (isFinalAssistantMessage(message)) flushTurn();
 			continue;
 		}
 

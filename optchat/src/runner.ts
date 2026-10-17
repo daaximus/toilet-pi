@@ -136,7 +136,6 @@ export class Runner {
 	#config: { provider: string | null; modelId: string | null; thinkingLevel: string | null } = { provider: null, modelId: null, thinkingLevel: null };
 	readonly #inputs = new Map<string, Tracked>();
 	readonly #bySubmission = new Map<number, string>();
-	readonly #queue: { inputId: string; text: string }[] = [];
 	readonly #tools = new Map<string, { toolName: string; args?: unknown; startedAt?: number }>();
 	#events: { stop(): Promise<unknown> } | undefined;
 	#controller: ReturnType<typeof createModelController> | undefined;
@@ -151,7 +150,7 @@ export class Runner {
 		},
 		sessionManager: { getSessionId: (): string | undefined => this.#identity?.sessionGuid },
 		isIdle: (): boolean => !this.#busy,
-		hasPendingMessages: (): boolean => this.#queue.length > 0,
+		hasPendingMessages: (): boolean => [...this.#inputs.values()].some((input) => input.state === "submitted"),
 		modelRegistry: { getAvailable: async () => this.#agent.modelRuntime.getAvailableSnapshot() },
 	};
 
@@ -479,7 +478,8 @@ export class Runner {
 			return;
 		}
 		if (type === "input") {
-			await this.#dispatch(typeof message.inputId === "string" ? message.inputId : randomUUID(), String(message.text ?? ""), "prompt");
+			// Web UI inputs have no explicit mode: steer if busy, just like the interactive pi runner.
+			await this.#dispatch(typeof message.inputId === "string" ? message.inputId : randomUUID(), String(message.text ?? ""), "steer");
 			return;
 		}
 		if (type === "abort" || type === "abort_and_release") {
@@ -493,7 +493,6 @@ export class Runner {
 	}
 
 	async #abort(): Promise<void> {
-		this.#queue.splice(0);
 		await this.#agent.root.abort(context);
 	}
 
@@ -509,16 +508,12 @@ export class Runner {
 		}
 	}
 
-	/** An input from the hub: a turn when idle, a steer while busy, or a follow-up kept for the next idle moment. */
+	/** An input from the hub: a turn when idle; both steers and follow-ups join the active turn while busy. */
 	async #dispatch(inputId: string, text: string, mode: string): Promise<void> {
 		if (this.#inputs.has(inputId)) return;
 		this.#inputs.set(inputId, { inputId, state: "submitted" });
 		if (this.#controller?.isConfiguring()) return this.#publish(inputId, "failed");
 		this.#publish(inputId, "submitted");
-		if (this.#busy && mode === "followUp") {
-			this.#queue.push({ inputId, text });
-			return;
-		}
 		if (this.#busy && mode === "prompt") return this.#publish(inputId, "failed");
 		await this.#submit(inputId, text);
 	}
@@ -568,13 +563,10 @@ export class Runner {
 					if (inputId !== undefined) this.#running(inputId);
 				}
 				return;
-			case "run_end": {
+			case "run_end":
 				this.#busy = false;
 				this.#emit({ type: "busy", busy: false });
-				const next = this.#queue.shift();
-				if (next !== undefined) await this.#submit(next.inputId, next.text);
 				return;
-			}
 			case "message_start":
 				if (event.message.role === "assistant") {
 					this.#partial.start(event.message);

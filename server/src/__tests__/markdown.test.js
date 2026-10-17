@@ -6,7 +6,7 @@ import { groupCollapsedHistory } from '../../public/history-grouping.js';
 import { createModelPicker } from '../../public/model-picker.js';
 
 const renderMarkdownSpy = vi.fn(renderMarkdown);
-let renderMessage, renderAssistantStream, renderToolMessage, renderHistoryFragments;
+let renderMessage, renderAssistantStream, renderToolMessage, renderHistoryFragments, setCollapseLiveTurnDetails;
 beforeAll(() => {
 	document.body.innerHTML = readFileSync('public/index.html', 'utf8');
 	vi.stubGlobal('matchMedia', () => ({ matches: false, addEventListener() {} }));
@@ -14,9 +14,9 @@ beforeAll(() => {
 	vi.stubGlobal('requestAnimationFrame', () => 0);
 	const source = readFileSync('public/app.js', 'utf8')
 		.replace(/^import .*;\n/gm, '');
-	({ renderMessage, renderAssistantStream, renderToolMessage, renderHistoryFragments } = new Function(
+	({ renderMessage, renderAssistantStream, renderToolMessage, renderHistoryFragments, setCollapseLiveTurnDetails } = new Function(
 		'renderMarkdown', 'groupCollapsedHistory', 'createModelPicker',
-		`${source}\nreturn { renderMessage, renderAssistantStream, renderToolMessage, renderHistoryFragments };`,
+		`${source}\nreturn { renderMessage, renderAssistantStream, renderToolMessage, renderHistoryFragments, setCollapseLiveTurnDetails };`,
 	)(renderMarkdownSpy, groupCollapsedHistory, createModelPicker));
 });
 
@@ -73,6 +73,27 @@ describe('assistant Markdown', () => {
 			renderAssistantStream(text);
 		}
 		expect(renderMarkdownSpy).toHaveBeenCalledTimes(202);
+	});
+	it('shows the final answer in collapsed history even with a trailing manual shell result', () => {
+		const session = { history: [
+			{ role: 'user', text: 'Check the gesture' },
+			{ role: 'assistant', stopReason: 'toolUse', thinkingText: 'Inspecting' },
+			{ role: 'toolResult', toolName: 'bash', text: 'tests passed' },
+			{ role: 'assistant', stopReason: 'stop', text: 'Found the cause: **15-bit values**.' },
+			{ role: 'toolResult', toolName: 'bash', text: '' },
+			{ role: 'user', text: 'Check other functions' },
+		] };
+		setCollapseLiveTurnDetails(true);
+		try {
+			const { fragments } = renderHistoryFragments(session);
+			const answers = fragments.filter((row) => row.classList.contains('assistant'));
+			expect(answers).toHaveLength(1);
+			expect(answers[0].textContent).toContain('Found the cause:');
+			expect(answers[0].querySelector('strong').textContent).toBe('15-bit values');
+			expect(fragments).toHaveLength(5);
+		} finally {
+			setCollapseLiveTurnDetails(false);
+		}
 	});
 	it('invalidates cached Markdown when message text changes', () => {
 		const message = { role: 'assistant', text: '**Before**' };
